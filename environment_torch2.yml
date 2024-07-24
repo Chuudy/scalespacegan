@@ -1,0 +1,35 @@
+name: scalespaceganT2
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch=2.3.0
+  - torchvision=0.18.0
+  - torchaudio=2.3.0
+  - pytorch-cuda=11.8
+  - numpy
+  - pandas
+  - jupyter
+  - pip
+  - tensorboard
+  - tqdm
+  - ipython
+  - pillow
+  - opencv
+  - imageio
+  - freetype-py
+  - pyopengl
+  - selenium
+  - setuptools==59.5.0
+  - pip:
+     - lpips
+     - easydict
+     - glfw
+     - ninja
+     - ipywidgets
+     - ipyevents
+     - click
+     - chromedriver-autoinstaller
+     - geemap

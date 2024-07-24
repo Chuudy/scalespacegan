@@ -1,0 +1,2602 @@
+diff --git a/metrics/equivariance.py b/metrics/equivariance.py
+index d5559ac..f1eeccb 100644
+--- a/metrics/equivariance.py
++++ b/metrics/equivariance.py
+@@ -154,6 +154,7 @@ def apply_affine_transformation(x, mat, up=4, **filter_kwargs):
+     # Resample image.
+     y = upfirdn2d.upsample2d(x=x, f=f, up=up, padding=p)
+     z = torch.nn.functional.grid_sample(y, g, mode='bilinear', padding_mode='zeros', align_corners=False)
++    # z = torch.nn.functional.adaptive_avg_pool2d(y, (H,W))
+ 
+     # Form mask.
+     m = torch.zeros_like(y)
+@@ -162,6 +163,16 @@ def apply_affine_transformation(x, mat, up=4, **filter_kwargs):
+     m = torch.nn.functional.grid_sample(m, g, mode='nearest', padding_mode='zeros', align_corners=False)
+     return z, m
+ 
++def apply_simplified_affine_transformation(img, mat, mode='replicate'):
++    _N, _C, H, W = img.shape
++    scale_factor = mat[0][0].cpu()
++    target_width = W * 1/scale_factor
++    padding_width = int((target_width - W) // 2)
++    padded_img = torch.nn.functional.pad(img, (padding_width, padding_width, padding_width, padding_width), mode=mode)
++    resampled_img = torch.nn.functional.adaptive_avg_pool2d(padded_img, (H,W))
++    mask = torch.ones_like(resampled_img)
++    return resampled_img, mask
++
+ #----------------------------------------------------------------------------
+ # Apply fractional rotation to a batch of 2D images. Corresponds to the
+ # operator R_\alpha in Appendix E.3.
+diff --git a/metrics/frechet_inception_distance.py b/metrics/frechet_inception_distance.py
+index b45edeb..8dc2c85 100644
+--- a/metrics/frechet_inception_distance.py
++++ b/metrics/frechet_inception_distance.py
+@@ -11,7 +11,9 @@
+ equilibrium". Matches the original implementation by Heusel et al. at
+ https://github.com/bioinf-jku/TTUR/blob/master/fid.py"""
+ 
++import sys
+ import numpy as np
++import torch
+ import scipy.linalg
+ from . import metric_utils
+ 
+@@ -40,6 +42,83 @@ def compute_fid(opts, max_real, num_gen):
+ 
+ #----------------------------------------------------------------------------
+ 
++def compute_fid_multiscale_continuous_mix(opts, max_real, num_gen):
++    # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
++    detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
++    detector_kwargs = dict(return_features=True) # Return raw features before the softmax layer.
++
++    mu_real, sigma_real = metric_utils.compute_feature_stats_for_dataset(
++        opts=opts, detector_url=detector_url, detector_kwargs=detector_kwargs,
++        rel_lo=0, rel_hi=0, capture_mean_cov=True, max_items=max_real).get_mean_cov()
++
++    mu_gen, sigma_gen = metric_utils.compute_feature_stats_for_generator_multiscale_continuous_mix(
++        opts=opts, detector_url=detector_url, detector_kwargs=detector_kwargs,
++        rel_lo=0, rel_hi=1, capture_mean_cov=True, max_items=num_gen).get_mean_cov()
++
++    if opts.rank != 0:
++        return float('nan')
++
++    m = np.square(mu_gen - mu_real).sum()
++    s, _ = scipy.linalg.sqrtm(np.dot(sigma_gen, sigma_real), disp=False) # pylint: disable=no-member
++    fid = np.real(m + np.trace(sigma_gen + sigma_real - s * 2))
++    return float(fid)
++
++#----------------------------------------------------------------------------
++
++def compute_fid_multiscale_continuous(opts, max_real, num_gen):
++    # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
++    detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
++    detector_kwargs = dict(return_features=True) # Return raw features before the softmax layer.
++
++    feature_stats_real = metric_utils.compute_feature_stats_for_dataset_multiscale_continuous(
++        opts=opts, detector_url=detector_url, detector_kwargs=detector_kwargs,
++        rel_lo=0, rel_hi=0, capture_mean_cov=True, max_items=max_real)
++
++    if opts.num_gpus > 1:
++        torch.distributed.barrier()
++
++    mu_sigma_real = {}
++    for scale, stats in feature_stats_real.items():
++        if stats.num_items > 0:
++            mu_sigma_real[scale] = stats.get_mean_cov()
++    data_scales = [float(s) for s in mu_sigma_real]
++    
++    feature_stats_gen = metric_utils.compute_feature_stats_for_generator_multiscale_continuous(
++        opts=opts, detector_url=detector_url, detector_kwargs=detector_kwargs,
++        scales=data_scales,
++        rel_lo=0, rel_hi=1, capture_mean_cov=True, max_items=num_gen)
++
++    if opts.num_gpus > 1:
++        torch.distributed.barrier()
++    
++    mu_sigma_gen = {}
++    for scale, stats in feature_stats_gen.items():
++        if stats.num_items > 0:
++            mu_sigma_gen[scale] = stats.get_mean_cov()
++
++    assert mu_sigma_real.keys() == mu_sigma_gen.keys(), "Scales of real and generated data don't match"
++    
++    fids = {}
++    fid_mean = 0
++    metric_base_string = f'fid_multiscale_{int(round(num_gen/1000))}k_'
++    for scale in mu_sigma_real:
++        fid = float('nan')
++        if opts.rank == 0:
++            mu_real, sigma_real = mu_sigma_real[scale]
++            mu_gen, sigma_gen = mu_sigma_gen[scale]
++            m = np.square(mu_gen - mu_real).sum()
++            s, _ = scipy.linalg.sqrtm(np.dot(sigma_gen, sigma_real), disp=False) # pylint: disable=no-member
++            fid = float(np.real(m + np.trace(sigma_gen + sigma_real - s * 2)))
++        fids[metric_base_string + str(scale)] = fid
++        fid_mean += fid
++    
++    fid_mean /= len(fids)
++    fids[metric_base_string + 'mean'] = fid_mean
++
++    return fids
++
++#----------------------------------------------------------------------------
++
+ def compute_fid_full(opts, resolution, max_real, num_gen, mode='full'):
+     # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
+     detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
+@@ -72,6 +151,8 @@ def compute_fid_full(opts, resolution, max_real, num_gen, mode='full'):
+     fid = np.real(m + np.trace(sigma_gen + sigma_real - s * 2))
+     return float(fid)
+ 
++#----------------------------------------------------------------------------
++
+ def compute_fid_patch(opts, resolution, max_real, num_gen, mode='patch'):
+     # Direct TorchScript translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
+     detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
+diff --git a/metrics/metric_main.py b/metrics/metric_main.py
+index 1179712..141259c 100644
+--- a/metrics/metric_main.py
++++ b/metrics/metric_main.py
+@@ -83,11 +83,88 @@ def report_metric(result_dict, run_dir=None, snapshot_pkl=None):
+ # Recommended metrics.
+ 
+ @register_metric
++
++def fid1k_full(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=1000)
++    return dict(fid1k_full=fid)
++
++def fid10k_full(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=10000)
++    return dict(fid10k_full=fid)
++
+ def fid50k_full(opts):
+     opts.dataset_kwargs.update(max_size=None, xflip=False)
+     fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=50000)
+     return dict(fid50k_full=fid)
+ 
++@register_metric
++def fid1k_full_multiscale(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale(opts, max_real=None, num_gen=1000)
++
++@register_metric
++def fid10k_full_multiscale(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale(opts, max_real=None, num_gen=10000)
++
++@register_metric
++def fid50k_full_multiscale(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale(opts, max_real=None, num_gen=50000)
++
++@register_metric
++def fid1k_full_multiscale_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_mix(opts, max_real=None, num_gen=1000)
++    return dict(fid1k_full_multiscale_mix=fid)
++
++@register_metric
++def fid10k_full_multiscale_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_mix(opts, max_real=None, num_gen=10000)
++    return dict(fid10k_full_multiscale_mix=fid)
++
++@register_metric
++def fid50k_full_multiscale_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_mix(opts, max_real=None, num_gen=50000)
++    return dict(fid50k_full_multiscale_mix=fid)
++
++@register_metric
++def fid1k_full_multiscale_continuous(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale_continuous(opts, max_real=None, num_gen=1000)
++
++@register_metric
++def fid10k_full_multiscale_continuous(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale_continuous(opts, max_real=None, num_gen=10000)
++
++@register_metric
++def fid50k_full_multiscale_continuous(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    return frechet_inception_distance.compute_fid_multiscale_continuous(opts, max_real=None, num_gen=50000)
++
++@register_metric
++def fid1k_full_multiscale_continuous_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_continuous_mix(opts, max_real=None, num_gen=1000)
++    return dict(fid1k_full_multiscale_continuous_mix=fid)
++
++@register_metric
++def fid10k_full_multiscale_continuous_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_continuous_mix(opts, max_real=None, num_gen=10000)
++    return dict(fid10k_full_multiscale_continuous_mix=fid)
++
++@register_metric
++def fid50k_full_multiscale_continuous_mix(opts):
++    opts.dataset_kwargs.update(max_size=None, xflip=False)
++    fid = frechet_inception_distance.compute_fid_multiscale_continuous_mix(opts, max_real=None, num_gen=50000)
++    return dict(fid50k_full_multiscale_continuous_mix=fid)
++
+ @register_metric
+ def kid50k_full(opts):
+     opts.dataset_kwargs.update(max_size=None, xflip=False)
+diff --git a/metrics/metric_utils.py b/metrics/metric_utils.py
+index 4e5fd38..4903538 100644
+--- a/metrics/metric_utils.py
++++ b/metrics/metric_utils.py
+@@ -25,11 +25,12 @@ import random
+ import sys
+ from util import renormalize
+ from util import patch_util
++from util.multiscale_util import random_transform_from_scale, transform_from_scale
+ 
+ #----------------------------------------------------------------------------
+ 
+ class MetricOptions:
+-    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True):
++    def __init__(self, G=None, G_kwargs={}, dataset_kwargs={}, num_gpus=1, rank=0, device=None, progress=None, cache=True, center_zoom=False, cond=False):
+         assert 0 <= rank < num_gpus
+         self.G              = G
+         self.G_kwargs       = dnnlib.EasyDict(G_kwargs)
+@@ -39,6 +40,8 @@ class MetricOptions:
+         self.device         = device if device is not None else torch.device('cuda', rank)
+         self.progress       = progress.sub() if progress is not None and rank == 0 else ProgressMonitor()
+         self.cache          = cache
++        self.center_zoom    = center_zoom
++        self.cond           = cond
+ 
+ #----------------------------------------------------------------------------
+ 
+@@ -269,6 +272,75 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
+         os.replace(temp_file, cache_file) # atomic
+     return stats
+ 
++#----------------------------------------------------------------------------
++
++def compute_feature_stats_for_dataset_multiscale_continuous(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, data_loader_kwargs=None, max_items=None, **stats_kwargs):
++    
++    assert opts.dataset_kwargs.class_name == "training.dataset.MultiscaleImageFolderDataset", "Multiscale-FID requires MultiscaleImageFolderDataset"
++    
++    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
++    if data_loader_kwargs is None:
++        data_loader_kwargs = dict(pin_memory=True, num_workers=3, prefetch_factor=2)
++
++    # Initialize.
++    num_items = len(dataset)
++    if max_items is not None:
++        num_items = min(num_items, max_items)
++    
++    # Binning scales 
++    dataset.sort_dataset_by_label()
++    dataset.floor_labels()
++
++    scale_counts = dataset.count_scale_labels()
++    
++    stats_multiscale = {}
++    for scale, count in scale_counts.items():
++        stats_multiscale[scale] = FeatureStats(max_items=count, **stats_kwargs)
++        
++    progress = opts.progress.sub(tag='dataset features (all scales)', num_items=num_items, rel_lo=rel_lo, rel_hi=rel_hi)
++    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
++
++    # Main loop.
++    item_subset = []
++    for i in range(num_items // opts.num_gpus + 1):
++        item = i * opts.num_gpus + opts.rank
++        if item < num_items:
++            item_subset.append(item)
++
++    for images, labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
++       
++        # the scales need to be floored again for binning
++        labels = torch.Tensor(np.floor(np.clip(labels, 0, max(labels)-0.001)))
++
++        if images.shape[1] == 1:
++            images = images.repeat([1, 3, 1, 1])
++        features = detector(images.to(opts.device), **detector_kwargs)
++        
++        # if all labels are the same, put the features into the respective bin
++        if torch.numel(torch.unique(labels, sorted=False)) == 1:
++            label = float(labels[0].cpu())
++            stats_multiscale[label].append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
++        else:
++            # scales only change sporadically in the dataset, so we split the batch manually
++            labels = torch.cat((labels, torch.tensor([-1]))) # add dummy label to signify end of batch, simplifying the code below
++            start_label = labels[0]
++            start_idx = 0
++            for sample_idx, label in enumerate(labels):
++                if label != start_label: # a jump from one scale to another occurred
++                    l = float(start_label.cpu())
++                    stats_multiscale[l].append_torch(features[start_idx:sample_idx], num_gpus=opts.num_gpus, rank=opts.rank)
++                    start_label = label
++                    start_idx = sample_idx
++
++        full_num_items = 0
++        for s in stats_multiscale.values():
++            full_num_items += s.num_items
++        progress.update(full_num_items)
++        
++    return stats_multiscale
++
++
++
+ #----------------------------------------------------------------------------
+ 
+ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, **stats_kwargs):
+@@ -304,6 +376,117 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
+ 
+ #----------------------------------------------------------------------------
+ 
++def compute_feature_stats_for_generator_multiscale_continuous_mix(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, **stats_kwargs):
++    if batch_gen is None:
++        batch_gen = min(batch_size, 4)
++    assert batch_size % batch_gen == 0
++
++    # create distribution of scales from data
++    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
++    min_scale = np.floor(dataset._get_raw_labels().min())
++    scale_counts = dataset.count_scale_labels()
++    scale_values_tensor = torch.from_numpy(np.array(list(scale_counts.keys()))) - min_scale
++    pmf = torch.zeros((len(scale_counts),))
++    for idx, count in enumerate(scale_counts.values()):
++        pmf[idx] = count
++    pmf /= len(dataset)
++    categorical = torch.distributions.categorical.Categorical(pmf)
++    
++    # Setup generator and labels.
++    G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
++    c_iter = iterate_random_labels(opts=opts, batch_size=batch_gen)
++
++    # Initialize.
++    stats = FeatureStats(**stats_kwargs)
++    assert stats.max_items is not None
++    progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
++    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
++
++    # Main loop.
++    while not stats.is_full():
++        images = []
++        for _i in range(batch_size // batch_gen):
++            z = torch.randn([batch_gen, G.z_dim], device=opts.device)
++            scale_batch = categorical.sample((batch_gen,))
++            scale_batch = scale_values_tensor[scale_batch]
++            if opts.center_zoom:
++                transform = transform_from_scale(scale_batch).to(opts.device)
++            else:
++                transform = random_transform_from_scale(scale_batch).to(opts.device)
++            if opts.cond:
++                img = G(z=z, c=scale_batch.unsqueeze(1).to(opts.device), transform=transform, **opts.G_kwargs)
++            else:
++                img = G(z=z, c=next(c_iter), transform=transform, **opts.G_kwargs)
++            img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
++            images.append(img)
++        images = torch.cat(images)
++        if images.shape[1] == 1:
++            images = images.repeat([1, 3, 1, 1])
++        features = detector(images, **detector_kwargs)
++        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
++        progress.update(stats.num_items)
++    return stats
++
++#----------------------------------------------------------------------------
++
++def compute_feature_stats_for_generator_multiscale_continuous(opts, detector_url, detector_kwargs, scales, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, **stats_kwargs):
++    if batch_gen is None:
++        batch_gen = min(batch_size, 4)
++    assert batch_size % batch_gen == 0
++
++    # Set up generator.
++    G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
++
++    # Initialize.
++    max_items_per_scale = stats_kwargs['max_items']
++    assert max_items_per_scale is not None
++    stats_multiscale = {}
++    for scale in scales:
++        stats_multiscale[scale] = FeatureStats(**stats_kwargs)
++    full_sample_count = len(stats_multiscale) * max_items_per_scale
++
++    progress = opts.progress.sub(tag='generator features (all scales)', num_items=full_sample_count, rel_lo=rel_lo, rel_hi=rel_hi)
++    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
++    
++    min_scale = min(scales)
++
++    # Main loop.
++    for scale, stats in stats_multiscale.items():
++    
++        while not stats.is_full():
++            images = []
++            for _i in range(batch_size // batch_gen):
++
++                z = torch.randn([batch_gen, G.z_dim], device=opts.device)
++        
++                scale_batch = torch.tensor(scale - min_scale).repeat(batch_gen)
++                scale_batch = torch.rand(batch_gen) + scale - min_scale
++                
++                if opts.center_zoom:
++                    transform = transform_from_scale(scale_batch).to(opts.device)
++                else:
++                    transform = random_transform_from_scale(scale_batch).to(opts.device)
++            
++                img = G(z=z, c=None, transform=transform, **opts.G_kwargs)
++            
++                img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
++                images.append(img)
++            images = torch.cat(images)
++            if images.shape[1] == 1:
++                images = images.repeat([1, 3, 1, 1])
++
++            features = detector(images, **detector_kwargs)
++            stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
++            
++            full_num_items = 0
++            for s in stats_multiscale.values():
++                full_num_items += s.num_items
++            progress.update(full_num_items)
++    
++    return stats_multiscale
++
++#----------------------------------------------------------------------------
++
+ ## additional functions added
+ 
+ # computes feature stats and transformation matrix for patches
+diff --git a/torch_utils/custom_ops.py b/torch_utils/custom_ops.py
+index dd7cc04..439e445 100644
+--- a/torch_utils/custom_ops.py
++++ b/torch_utils/custom_ops.py
+@@ -28,10 +28,10 @@ verbosity = 'brief' # Verbosity level: 'none', 'brief', 'full'
+ 
+ def _find_compiler_bindir():
+     patterns = [
+-        'C:/Program Files (x86)/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Hostx64/x64',
+-        'C:/Program Files (x86)/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64',
+-        'C:/Program Files (x86)/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Hostx64/x64',
+-        'C:/Program Files (x86)/Microsoft Visual Studio */vc/bin',
++        'C:/Program Files*/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Hostx64/x64',
++        'C:/Program Files*/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64',
++        'C:/Program Files*/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Hostx64/x64',
++        'C:/Program Files*/Microsoft Visual Studio */vc/bin',
+     ]
+     for pattern in patterns:
+         matches = sorted(glob.glob(pattern))
+diff --git a/torch_utils/misc.py b/torch_utils/misc.py
+index 335397d..461bd6b 100644
+--- a/torch_utils/misc.py
++++ b/torch_utils/misc.py
+@@ -12,6 +12,7 @@ import numpy as np
+ import torch
+ import warnings
+ import dnnlib
++import copy
+ 
+ #----------------------------------------------------------------------------
+ # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
+@@ -141,6 +142,197 @@ class InfiniteSampler(torch.utils.data.Sampler):
+                 order[i], order[j] = order[j], order[i]
+             idx += 1
+ 
++
++#----------------------------------------------------------------------------
++# Sampler for torch.utils.data.DataLoader that loops over the dataset
++# indefinitely, shuffling items as it goes.
++
++class InfiniteBalancedSampler(torch.utils.data.Sampler):
++    def __init__(self, dataset, rank=0, num_replicas=1, shuffle=True, seed=0, window_size=0.5, boost_last=1):
++        assert len(dataset) > 0
++        assert num_replicas > 0
++        assert 0 <= rank < num_replicas
++        assert 0 <= window_size <= 1
++        super().__init__(dataset)
++        self.dataset = dataset
++        self.rank = rank
++        self.num_replicas = num_replicas
++        self.shuffle = shuffle
++        self.seed = seed
++        self.window_size = window_size
++        self.boost_last = boost_last-1
++        self.create_scale_index_dictionary()
++
++    def __iter__(self):
++        # order = np.arange(len(self.dataset))
++        # rnd = None
++        # window = 0
++
++        if self.shuffle:
++            for i in range(self.n_scales):
++                rnd = np.random.RandomState(self.seed)
++                order = self.scale_index_dictionary[i]
++                rnd.shuffle(order)
++                window = int(np.rint(order.size * self.window_size))
++                self.scale_index_dictionary[i] = order
++                self.window[i] = window
++
++        while True:
++            # select random scale
++            curr_scale_index = int(np.clip(rnd.randint(self.n_scales + self.boost_last), a_min=None, a_max=self.n_scales-1))
++
++            # read all necessary variables for current scale
++            idx = self.scale_iterator[curr_scale_index]
++            order = self.scale_index_dictionary[curr_scale_index]
++            window = self.window[curr_scale_index]
++
++            # get sample and shuffle
++            i = idx % order.size
++            if idx % self.num_replicas == self.rank:
++                yield order[i]
++            if window >= 2:
++                j = (i - rnd.randint(window)) % order.size
++                order[i], order[j] = order[j], order[i]
++            idx += 1
++
++            # write modifed values back to object fields
++            self.scale_iterator[curr_scale_index] = idx
++            self.scale_index_dictionary[curr_scale_index] = order
++
++
++    def create_scale_index_dictionary(self):
++        tmp_dataset = copy.deepcopy(self.dataset)
++        indices = tmp_dataset._raw_idx
++        scales = tmp_dataset._get_raw_labels()
++        raw_scales_floored = np.floor(np.clip(scales, 0, max(scales)-0.001))
++        distinct_scales = set(raw_scales_floored)
++        scale_index_dictionary = {}
++        scale_iterator = {}
++        scale_n_elements = {}        
++        window = {}
++        for scale in distinct_scales:
++            scale_indices = np.where(raw_scales_floored == scale)[0]
++            scale_index_dictionary[scale] = scale_indices
++            scale_iterator[scale] = 0
++            window[scale] = 0
++            scale_n_elements[scale] = len(scale_indices)
++        self.scale_index_dictionary = scale_index_dictionary
++        self.scale_iterator = scale_iterator
++        self.scale_n_elements = scale_n_elements
++        self.window = window
++        self.n_scales = len(distinct_scales)
++        pass
++
++
++
++#----------------------------------------------------------------------------
++# Sampler for torch.utils.data.DataLoader that loops over the dataset skewing distribution towards high magnitudes over time
++# indefinitely, shuffling items as it goes.
++
++class InfiniteSkewedSampler(torch.utils.data.Sampler):
++    def __init__(self, dataset, rank=0, num_replicas=1, shuffle=True, seed=0, window_size=0.5, boost_first=1, boost_last=1, max_skew_kimgs=5000, warmup_kimgs=0, curr_kimgs=0):
++        assert len(dataset) > 0
++        assert num_replicas > 0
++        assert 0 <= rank < num_replicas
++        assert 0 <= window_size <= 1
++        super().__init__(dataset)
++        self.dataset = dataset
++        self.rank = rank
++        self.num_replicas = num_replicas
++        self.shuffle = shuffle
++        self.seed = seed
++        self.window_size = window_size
++        self.boost_first = boost_first
++        self.boost_last = boost_last
++        self.warmup_imgs = warmup_kimgs*1000
++        self.max_skew_imgs = max_skew_kimgs*1000 - self.warmup_imgs
++        self.curr_skew_imgs = curr_kimgs * 1000
++        self.curr_max_prob = 1
++        self.create_scale_index_dictionary()
++
++    def __iter__(self):
++        # order = np.arange(len(self.dataset))
++        # rnd = None
++        # window = 0
++
++        if self.shuffle:
++            for i in range(self.n_scales):
++                rnd = np.random.RandomState(self.seed)
++                order = self.scale_index_dictionary[i]
++                rnd.shuffle(order)
++                window = int(np.rint(order.size * self.window_size))
++                self.scale_index_dictionary[i] = order
++                self.window[i] = window
++
++        while True:
++            # select random scale
++
++            tmp_skew_imgs = max([self.curr_skew_imgs - self.warmup_imgs, 0])
++            signed_skew_imgs = self.curr_skew_imgs - self.warmup_imgs
++            self.curr_skew_imgs += 1
++
++            if signed_skew_imgs < 0:
++                tmp_skew_imgs = np.abs(signed_skew_imgs)
++                alpha = tmp_skew_imgs / self.warmup_imgs
++                max_prob = alpha * self.boost_first + (1-alpha)
++                self.curr_max_prob = -max_prob
++                probs = 2**np.linspace(max_prob, 1, self.n_scales)
++            else:
++                alpha = tmp_skew_imgs / self.max_skew_imgs      
++                max_prob = alpha * self.boost_last + (1-alpha)
++                self.curr_max_prob = max_prob
++                probs = np.linspace(1, max_prob, self.n_scales)
++            m = torch.distributions.categorical.Categorical(torch.tensor(probs))
++            curr_scale_index = int(m.sample())
++
++            # curr_scale_index = int(np.clip(rnd.randint(self.n_scales + self.boost_last), a_min=None, a_max=self.n_scales-1))
++
++            # read all necessary variables for current scale
++            idx = self.scale_iterator[curr_scale_index]
++            order = self.scale_index_dictionary[curr_scale_index]
++            window = self.window[curr_scale_index]
++
++            # get sample and shuffle
++            i = idx % order.size
++            if idx % self.num_replicas == self.rank:
++                yield order[i]
++            if window >= 2:
++                j = (i - rnd.randint(window)) % order.size
++                order[i], order[j] = order[j], order[i]
++            idx += 1
++
++            # write modifed values back to object fields
++            self.scale_iterator[curr_scale_index] = idx
++            self.scale_index_dictionary[curr_scale_index] = order
++
++
++    def create_scale_index_dictionary(self):
++        tmp_dataset = copy.deepcopy(self.dataset)
++        indices = tmp_dataset._raw_idx
++        scales = tmp_dataset._get_raw_labels()
++        raw_scales_floored = np.floor(np.clip(scales, 0, max(scales)-0.001))
++        distinct_scales = set(raw_scales_floored)
++        scale_index_dictionary = {}
++        scale_iterator = {}
++        scale_n_elements = {}        
++        window = {}        
++        min_scale = np.min(list(distinct_scales))
++        for scale in distinct_scales:
++            scale_index = int(scale - min_scale)
++            scale_indices = np.where(raw_scales_floored == scale)[0]
++            scale_index_dictionary[scale_index] = scale_indices
++            scale_iterator[scale_index] = 0
++            window[scale_index] = 0
++            scale_n_elements[scale_index] = len(scale_indices)
++        self.scale_index_dictionary = scale_index_dictionary
++        self.scale_iterator = scale_iterator
++        self.scale_n_elements = scale_n_elements
++        self.window = window
++        self.n_scales = len(distinct_scales)
++        pass
++            
++
++
+ #----------------------------------------------------------------------------
+ # Utilities for operating with torch.nn.Module parameters and buffers.
+ 
+diff --git a/torch_utils/ops/bias_act.py b/torch_utils/ops/bias_act.py
+index 5c485c0..b2b53d7 100644
+--- a/torch_utils/ops/bias_act.py
++++ b/torch_utils/ops/bias_act.py
+@@ -43,7 +43,7 @@ def _init():
+             sources=['bias_act.cpp', 'bias_act.cu'],
+             headers=['bias_act.h'],
+             source_dir=os.path.dirname(__file__),
+-            extra_cuda_cflags=['--use_fast_math'],
++            extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
+         )
+     return True
+ 
+diff --git a/torch_utils/ops/conv2d_gradfix.py b/torch_utils/ops/conv2d_gradfix.py
+index 388778f..156b6b2 100644
+--- a/torch_utils/ops/conv2d_gradfix.py
++++ b/torch_utils/ops/conv2d_gradfix.py
+@@ -11,6 +11,7 @@ arbitrarily high order gradients with zero performance penalty."""
+ 
+ import contextlib
+ import torch
++from pkg_resources import parse_version
+ 
+ # pylint: disable=redefined-builtin
+ # pylint: disable=arguments-differ
+@@ -20,6 +21,7 @@ import torch
+ 
+ enabled = False                     # Enable the custom op by setting this to true.
+ weight_gradients_disabled = False   # Forcefully disable computation of gradients with respect to the weights.
++_use_pytorch_1_11_api = parse_version(torch.__version__) >= parse_version('1.11.0a') # Allow prerelease builds of 1.11
+ 
+ @contextlib.contextmanager
+ def no_weight_gradients(disable=True):
+@@ -48,6 +50,9 @@ def _should_use_custom_op(input):
+     assert isinstance(input, torch.Tensor)
+     if (not enabled) or (not torch.backends.cudnn.enabled):
+         return False
++    if _use_pytorch_1_11_api:
++        # The work-around code doesn't work on PyTorch 1.11.0 onwards
++        return False
+     if input.device.type != 'cuda':
+         return False
+     return True
+diff --git a/torch_utils/ops/grid_sample_gradfix.py b/torch_utils/ops/grid_sample_gradfix.py
+index 979ee83..017f03a 100644
+--- a/torch_utils/ops/grid_sample_gradfix.py
++++ b/torch_utils/ops/grid_sample_gradfix.py
+@@ -12,6 +12,7 @@ Only works on 2D images and assumes
+ `mode='bilinear'`, `padding_mode='zeros'`, `align_corners=False`."""
+ 
+ import torch
++from pkg_resources import parse_version
+ 
+ # pylint: disable=redefined-builtin
+ # pylint: disable=arguments-differ
+@@ -20,6 +21,8 @@ import torch
+ #----------------------------------------------------------------------------
+ 
+ enabled = False  # Enable the custom op by setting this to true.
++_use_pytorch_1_11_api = parse_version(torch.__version__) >= parse_version('1.11.0a') # Allow prerelease builds of 1.11
++_use_pytorch_1_12_api = parse_version(torch.__version__) >= parse_version('1.12.0a') # Allow prerelease builds of 1.12
+ 
+ #----------------------------------------------------------------------------
+ 
+@@ -56,7 +59,13 @@ class _GridSample2dBackward(torch.autograd.Function):
+     @staticmethod
+     def forward(ctx, grad_output, input, grid):
+         op = torch._C._jit_get_operation('aten::grid_sampler_2d_backward')
+-        grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
++        if _use_pytorch_1_12_api:
++            op = op[0]
++        if _use_pytorch_1_11_api:
++            output_mask = (ctx.needs_input_grad[1], ctx.needs_input_grad[2])
++            grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False, output_mask)
++        else:
++            grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+         ctx.save_for_backward(grid)
+         return grad_input, grad_grid
+ 
+diff --git a/train.py b/train.py
+index 1599bbe..b323eb3 100644
+--- a/train.py
++++ b/train.py
+@@ -22,6 +22,8 @@ from metrics import metric_main
+ from torch_utils import training_stats
+ from torch_utils import custom_ops
+ 
++import numpy as np
++
+ #----------------------------------------------------------------------------
+ 
+ def subprocess_fn(rank, c, temp_dir):
+@@ -48,7 +50,7 @@ def subprocess_fn(rank, c, temp_dir):
+ 
+ #----------------------------------------------------------------------------
+ 
+-def launch_training(c, desc, outdir, dry_run):
++def launch_training(c, desc, outdir, dry_run, opts):
+     dnnlib.util.Logger(should_flush=True)
+ 
+     # Pick output directory.
+@@ -58,8 +60,11 @@ def launch_training(c, desc, outdir, dry_run):
+     prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
+     prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
+     cur_run_id = max(prev_run_ids, default=-1) + 1
+-    c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
+-    assert not os.path.exists(c.run_dir)
++    if(opts.iter_dir):
++        c.run_dir = os.path.join(outdir, f'{cur_run_id:05d}-{desc}')
++        assert not os.path.exists(c.run_dir)
++    else:
++        c.run_dir = outdir
+ 
+     # Print options.
+     print()
+@@ -75,12 +80,6 @@ def launch_training(c, desc, outdir, dry_run):
+     print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
+     print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
+     print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
+-    if 'patch' in c.G_kwargs.training_mode:
+-        print(f'Patches path:        {c.patch_kwargs.path}')
+-        print(f'Patches size:        {c.patch_kwargs.max_size} images')
+-        print(f'Patches resolution:  {c.patch_kwargs.resolution}')
+-        print(f'Patches labels:      {c.patch_kwargs.use_labels}')
+-        print(f'Patches x-flips:     {c.patch_kwargs.xflip}')
+     print()
+ 
+     # Dry run?
+@@ -90,7 +89,7 @@ def launch_training(c, desc, outdir, dry_run):
+ 
+     # Create output directory.
+     print('Creating output directory...')
+-    os.makedirs(c.run_dir)
++    os.makedirs(c.run_dir,exist_ok=True)
+     with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
+         json.dump(c, f, indent=2)
+ 
+@@ -105,9 +104,11 @@ def launch_training(c, desc, outdir, dry_run):
+ 
+ #----------------------------------------------------------------------------
+ 
+-def init_dataset_kwargs(data):
++def init_dataset_kwargs(data, training_mode):
+     try:
+-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
++        dataset_class_name = 'training.dataset.MultiscaleImageFolderDataset' if 'multiscale' in training_mode else 'training.dataset.ImageFolderDataset'
++        dataset_kwargs = dnnlib.EasyDict(class_name=dataset_class_name, path=data, use_labels=True, max_size=None, xflip=False)
++        
+         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
+         try:
+             dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
+@@ -135,7 +136,7 @@ def parse_comma_separated_list(s):
+ 
+ # Required.
+ @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
+-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), required=True)
++@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-r', 'stylegan3-ms']), required=True)
+ @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
+ @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
+ @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
+@@ -146,6 +147,8 @@ def parse_comma_separated_list(s):
+ @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
+ @click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['noaug', 'ada', 'fixed']), default='ada', show_default=True)
+ @click.option('--resume',       help='Resume from given network pickle', metavar='[PATH|URL]',  type=str)
++@click.option('--auto-resume',  help='Auto resume from given directory', metavar='[PATH|URL]',  type=str)
++@click.option('--tick_stop',    help='Number of ticks in current session of training',          type=click.IntRange(min=-1), default=-1)
+ @click.option('--freezed',      help='Freeze first layers of D', metavar='INT',                 type=click.IntRange(min=0), default=0, show_default=True)
+ 
+ # Misc hyperparameters.
+@@ -161,43 +164,62 @@ def parse_comma_separated_list(s):
+ 
+ # Misc settings.
+ @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
+-@click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
++@click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid1k_full_multiscale_mix', show_default=True)
+ @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
+-@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
++@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.FloatRange(min=0.01), default=4, show_default=True)
+ @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
+ @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
+ @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
+ @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
+ @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
+ @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
++@click.option('--iter-dir',     help='Create iterative directory if dir exists', metavar='BOOL',type=bool, default=True, show_default=False)
++@click.option('--progfreqs',            help='Enable progressive frequencies',                          is_flag=True)
++@click.option('--centerzoom',           help='Zoom into image center only',                             is_flag=True)
++
++# additional options for scale sampling
++@click.option('--uniform_sampling',     help='Sample all magnitudes in a uniform manner instead of sampling bound to input data',               is_flag=True)
++@click.option('--skewed_sampling',      help='Sample magnitudes in a skewed manner towards the high magnitudes, number means how many kimgs are needed to reach the final distribution',   type=click.IntRange(min=0), default=0, show_default=True)
++@click.option('--warmup_kimgs',         help='Describes how many kimgs need to be processed before sampling starts to skew',   type=click.IntRange(min=0), default=0, show_default=True)
+ 
+ # additional base options
+-@click.option('--training_mode', help='generator training mode', type=click.Choice(['global', 'patch', 'global-360']), required=True)
+-@click.option('--data_resolution', help='LR dataset resolution (specify if images are not preprocessed to same size and square)', type=click.IntRange(min=0))
+-@click.option('--random_crop', help='random crop image on LR dataset (specify if images are not preprocessed to same size and square)', metavar='BOOL', type=bool, default=False, show_default=True)
+-@click.option('--data_max_size', help='LR dataset max number of images', type=click.IntRange(min=0))
+-@click.option('--g_size', help='size of G (if different from dataset size)', type=click.IntRange(min=0))
+-
+-# additional options for patch model
+-@click.option('--teacher', help='teacher checkpoint', metavar='[PATH|URL]',  type=str)
+-@click.option('--teacher_lambda', help='teacher regularization weight', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
+-@click.option('--teacher_mode',  help='teacher loss mode', type=click.Choice(['inverse', 'forward']), default='forward', show_default=True)
+-@click.option('--scale_anneal', help='scale annealing rate (-1 for no annealing)', metavar='FLOAT', type=click.FloatRange(min=-1), default=-1, show_default=True)
+-@click.option('--scale_min',  help='minimum sampled scale (leave blank to use image native resolution)', metavar='FLOAT', type=click.FloatRange(min=0))
+-@click.option('--scale_max',  help='maximum sampled scale', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
+-@click.option('--base_probability', help='probability to sample from LR dataset with identity transform', metavar='FLOAT', type=click.FloatRange(min=0), default=0.5, show_default=True)
+-@click.option('--data_hr', help='HR patch dataset path', metavar='[ZIP|DIR]', type=str)
+-@click.option('--patch_crop', help='perform random cropping on non-square images (on patch dataset)', metavar='BOOL', type=bool, default=False, show_default=True)
+-@click.option('--data_hr_max_size', help='patch dataset max number of images', type=click.IntRange(min=0))
+-@click.option('--scale_mapping_min', help='normalization minimum for scale mapping branch (size = g_size*scale_mapping_min)', type=click.IntRange(min=0))
+-@click.option('--scale_mapping_max', help='normalization maximum for scale mapping branch (size = g_size*scale_mapping_max)', type=click.IntRange(min=0))
+-@click.option('--scale_mapping_norm', help='normalization type for scale mapping branch', type=click.Choice(['positive', 'zerocentered']), default='positive')
+-
+-# additional options for 360 model
+-@click.option('--fov', help='fov for one frame in the 360 model', type=click.IntRange(min=0), default=60, show_default=True)
++@click.option('--training_mode',        help='generator training mode', type=click.Choice(['global', 'multiscale']), required=True)
++
++# additional options for scale consistency loss
++@click.option('--consistency_lambda',           help='scale consistency regularization weight', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
++@click.option('--consistency_mode',             help='scale consistency loss mode', type=click.Choice(['multiscale_forward', 'multiscale_inverse']), default='multiscale_inverse', show_default=True)
++@click.option('--consistency_loss_select',      help='selection of losses used for scale consistency: L1 or (L1 and LPIPS)', type=click.Choice(['both', 'l1']), default='both', show_default=True)
++@click.option('--consistency_scale_min',        help='minimum scale consistency reference scale delta', metavar='FLOAT', type=click.FloatRange(min=1), default=1.0, show_default=True)
++@click.option('--consistency_scale_max',        help='maximum scale consistency reference scale delta', metavar='FLOAT', type=click.FloatRange(min=1), default=2.0, show_default=True)
++@click.option('--consistency_scale_sampling',   help='specifies the sampling/clamping method for scale consistency reference', type=click.Choice(['unbounded', 'uniform', 'beta']), default='beta', show_default=True)
++@click.option('--random_gradient_off',          help='disables gradient backprop randomly through one or the other branch in scale consistency loss', is_flag=True)
++
++# additional options for scale normalization
++@click.option('--scale_mapping_norm',       help='normalization type for scale mapping branch', type=click.Choice(['positive', 'zerocentered']), default='positive')
++
++# additional misc options
++@click.option('--debug',                    help='does not save pickles', is_flag=True)
++@click.option('--n_redist_layers',          help='number of layers frequencies are redistributed across', type=click.IntRange(min=1), default=1)
++@click.option('--last_redist_layer',        help='last layer frequencies are redistributed across', type=click.IntRange(min=1), default=10)
++@click.option('--auto_last_redist_layer',   help='sets first max resolution layer as last frequency redistribution layer', is_flag=True)
++@click.option('--num_layers',               help='Number of generator layers (does not include synthesis input and final toRGB layer)', type=click.IntRange(min=10), default=14)
++@click.option('--scale_count_fixed',        help='Decreases scale count in SynthesisInput', type=click.IntRange(min=-1), default=5)
++@click.option('--boost_first',              help='multiplies the chance of last magnitude being sampled during the training', type=click.IntRange(min=1), default=1)
++@click.option('--boost_last',               help='multiplies the chance of last magnitude being sampled during the training', type=click.IntRange(min=1), default=1)
++@click.option('--distribution_threshold',   help='Sets distribution threshold factor', metavar='FLOAT', type=click.FloatRange(min=1), default=2*np.sqrt(2), show_default=True)
++
++# options for binned frequency distribution
++@click.option('--n_bins',                   help='Sets number of bins for binned frequencies', type=click.IntRange(min=1), default=1)
++@click.option('--bin_transform_offset',     help='Sets transform offset for binned frequencies', type=click.FloatRange(min=0), default=3)
++@click.option('--bin_blend_width',          help='Sets blending range for binned frequencies', metavar='FLOAT', type=click.FloatRange(min=0.001), default=1, show_default=True)
++@click.option('--bin_blend_offset',         help='Sets blending offset for binned frequencie', metavar='FLOAT', type=click.FloatRange(min=-2), default=-1, show_default=True)
++
++
+ 
+ def main(**kwargs):
+ 
++    print("\nTraining starts\n", flush=True)
++
+     # Initialize config.
+     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
+     c = dnnlib.EasyDict() # Main config dict.
+@@ -208,67 +230,36 @@ def main(**kwargs):
+     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
+     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+ 
+-    # Training set.
+-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+-    if opts.cond and not c.training_set_kwargs.use_labels:
+-        raise click.ClickException('--cond=True requires labels specified in dataset.json')
+-    c.training_set_kwargs.use_labels = opts.cond
+-    c.training_set_kwargs.xflip = opts.mirror
+-    if opts.data_max_size:
+-        c.training_set_kwargs.max_size = opts.max_size
+-    if opts.data_resolution:
+-        if c.training_set_kwargs.resolution != opts.data_resolution:
+-            print("using specified data resolution %d rather than default" % (opts.data_resolution))
+-            c.training_set_kwargs.resolution = opts.data_resolution
+-    c.training_set_kwargs.crop_image = opts.random_crop
+-    # by this point, resolution should be determined
+-    # either from init_dataset function or opts.data_resolution
+-    assert(c.training_set_kwargs.resolution is not None)
+-
+-    # set up training mode
++    # Set training mode
+     training_mode = c.G_kwargs.training_mode = opts.training_mode
+-    # set up generator size
+-    if opts.g_size is not None:
+-        assert(opts.g_size == c.training_set_kwargs.resolution)
++    c.G_kwargs.progressive_freqs = opts.progfreqs
++    
++    # Training set.
++    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, training_mode=training_mode)
++    if not 'multiscale' in training_mode:
++        if opts.cond and not c.training_set_kwargs.use_labels:
++            raise click.ClickException('--cond=True requires labels specified in dataset.json')
++        c.training_set_kwargs.use_labels = opts.cond
+     else:
+-        opts.g_size = c.training_set_kwargs.resolution
+-    if 'patch' in training_mode:
+-        # patch dataset kwargs
+-        patch_kwargs = dnnlib.EasyDict(
+-            class_name='training.dataset.ImagePatchDataset',
+-            path=opts.data_hr, resolution=opts.g_size,
+-            scale_min=opts.scale_min, scale_max=opts.scale_max,
+-            scale_anneal=opts.scale_anneal, random_crop=opts.patch_crop,
+-            use_labels=True, max_size=None, xflip=False)
+-        patch_obj = dnnlib.util.construct_class_by_name(**patch_kwargs) # gets initial args
+-        patch_name = patch_obj.name
+-        patch_kwargs.resolution = patch_obj.resolution # Be explicit about resolution.
+-        patch_kwargs.use_labels = patch_obj.has_labels # Be explicit about labels.
+-        patch_kwargs.max_size = len(patch_obj) # Be explicit about dataset size.
+-        c.patch_kwargs = patch_kwargs
+-        c.patch_kwargs.use_labels = opts.cond
+-        c.patch_kwargs.xflip = opts.mirror
+-        if opts.data_hr_max_size:
+-            c.patch_kwargs.max_size = opts.data_hr_max_size
++        c.training_set_kwargs.use_labels = True # use scale labels
++    c.training_set_kwargs.xflip = opts.mirror
++
++    # Modify parameters for scalespacegan training
++    if 'multiscale' in training_mode:
+         # added G_kwargs
+         c.G_kwargs.scale_mapping_kwargs = dnnlib.EasyDict(
+-            scale_mapping_min = opts.scale_mapping_min,
+-            scale_mapping_max = opts.scale_mapping_max,
+             scale_mapping_norm = opts.scale_mapping_norm
+         )
+         # added training options
+         c.added_kwargs = dnnlib.EasyDict(
+-            img_size=opts.g_size,
+-            teacher=opts.teacher,
+-            teacher_lambda=opts.teacher_lambda,
+-            teacher_mode=opts.teacher_mode,
+-            scale_min=opts.scale_min,
+-            scale_max=opts.scale_max,
+-            scale_anneal=opts.scale_anneal,
+-            base_probability=opts.base_probability,
++            consistency_lambda=opts.consistency_lambda,
++            consistency_mode=opts.consistency_mode,
++            consistency_scale_min=opts.consistency_scale_min,
++            consistency_scale_max=opts.consistency_scale_max,
++            consistency_loss_select=opts.consistency_loss_select,
++            consistency_scale_sampling=opts.consistency_scale_sampling,            
++            random_gradient_off = opts.random_gradient_off
+         )
+-    elif '360' in training_mode:
+-        c.G_kwargs.fov = opts.fov
+ 
+     # Hyperparameters & settings.
+     c.num_gpus = opts.gpus
+@@ -287,10 +278,10 @@ def main(**kwargs):
+     c.kimg_per_tick = opts.tick
+     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
+     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
+-    if 'patch' in training_mode:
+-        c.patch_kwargs.random_seed = opts.seed
+     c.data_loader_kwargs.num_workers = opts.workers
+ 
++    c.center_zoom = opts.centerzoom
++
+     # Sanity checks.
+     if c.batch_size % c.num_gpus != 0:
+         raise click.ClickException('--batch must be a multiple of --gpus')
+@@ -313,14 +304,17 @@ def main(**kwargs):
+     else:
+         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
+         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
++        c.G_kwargs.conv_kernel = 1 # Use 1x1 convolutions.
++        c.G_kwargs.use_radial_filters = True # Use radially symmetric downsampling filters.
++        c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
++        c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+         if opts.cfg == 'stylegan3-r':
+-            c.G_kwargs.conv_kernel = 1 # Use 1x1 convolutions.
+             c.G_kwargs.channel_base *= 2 # Double the number of feature maps.
+             c.G_kwargs.channel_max *= 2
+-            c.G_kwargs.use_radial_filters = True # Use radially symmetric downsampling filters.
+-            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+-            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+-
++        if opts.cfg == 'stylegan3-ms':            
++            c.G_kwargs.channel_base *= 4 # Quadruple the number of feature maps.
++            c.G_kwargs.channel_max *= 4
++        
+     # Augmentation.
+     if opts.aug != 'noaug':
+         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
+@@ -332,10 +326,7 @@ def main(**kwargs):
+     # Resume.
+     if opts.resume is not None:
+         c.resume_pkl = opts.resume
+-
+-    if opts.teacher is not None or opts.resume is not None:
+-        # disable rampups for finetuning or resuming models
+-        c.ada_kimg = 100 # Make ADA react faster at the beginning.
++        # c.ada_kimg = 100 # Make ADA react faster at the beginning.
+         c.ema_rampup = None # Disable EMA rampup.
+         c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
+ 
+@@ -351,8 +342,50 @@ def main(**kwargs):
+     if opts.desc is not None:
+         desc += f'-{opts.desc}'
+ 
++    # Auto resume.
++    if opts.auto_resume:
++
++        pickle_dir = os.path.join(opts.outdir, f'{opts.auto_resume}-{desc}')
++        last_pickle_dummy_filepath = os.path.join(pickle_dir, 'last.pkl')
++        if(os.path.exists(last_pickle_dummy_filepath)):
++            with open(last_pickle_dummy_filepath) as f:
++                last_pickle_filename = f.readline()
++            last_pickle_filepath = os.path.join(pickle_dir, last_pickle_filename)
++            c.resume_pkl = last_pickle_filepath
++            c.resume_kimg = int(re.search(r"\d{6}", last_pickle_filename).group())
++            c.auto_resume_p = True
++        opts.iter_dir = False
++        opts.outdir = pickle_dir
++
++    if opts.uniform_sampling:
++        c.uniform_sampling = True
++
++    if opts.debug:
++        c.debug = True
++
++    c.G_kwargs.n_redist_layers = opts.n_redist_layers
++    c.G_kwargs.last_redist_layer = opts.last_redist_layer
++    c.G_kwargs.num_layers = opts.num_layers
++    c.G_kwargs.scale_count_fixed = opts.scale_count_fixed
++
++    c.boost_first = opts.boost_first
++    c.boost_last = opts.boost_last
++    c.max_skew_kimgs = opts.skewed_sampling
++    c.warmup_kimgs = opts.warmup_kimgs
++
++    c.G_kwargs.auto_last_redist_layer = True if opts.auto_last_redist_layer else False
++    c.G_kwargs.distribution_threshold = opts.distribution_threshold
++
++    c.G_kwargs.n_bins = opts.n_bins
++    c.G_kwargs.bin_transform_offset = opts.bin_transform_offset
++    c.G_kwargs.bin_blend_width = opts.bin_blend_width
++    c.G_kwargs.bin_blend_offset = opts.bin_blend_offset
++
++    c.cond = opts.cond
++    c.tick_stop = opts.tick_stop
++
+     # Launch.
+-    launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run)
++    launch_training(c=c, desc=desc, outdir=opts.outdir, dry_run=opts.dry_run, opts=opts)
+ 
+ #----------------------------------------------------------------------------
+ 
+diff --git a/training/dataset.py b/training/dataset.py
+index 6827afc..b03cc0d 100644
+--- a/training/dataset.py
++++ b/training/dataset.py
+@@ -56,7 +56,7 @@ class Dataset(torch.utils.data.Dataset):
+         if self._raw_labels is None:
+             self._raw_labels = self._load_raw_labels() if self._use_labels else None
+             if self._raw_labels is None:
+-                self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
++                self._raw_labels = np.zeros([self._raw_shape[0], 1], dtype=np.float32)
+             assert isinstance(self._raw_labels, np.ndarray)
+             assert self._raw_labels.shape[0] == self._raw_shape[0]
+             assert self._raw_labels.dtype in [np.float32, np.int64]
+@@ -64,6 +64,12 @@ class Dataset(torch.utils.data.Dataset):
+                 assert self._raw_labels.ndim == 1
+                 assert np.all(self._raw_labels >= 0)
+         return self._raw_labels
++    
++    def _set_raw_labels(self, raw_labels):
++        self._raw_labels = raw_labels
++
++    def _set_raw_idx(self, raw_idx):
++        self._raw_idx = raw_idx
+ 
+     def close(self): # to be overridden by subclass
+         pass
+@@ -111,6 +117,8 @@ class Dataset(torch.utils.data.Dataset):
+             onehot = np.zeros(self.label_shape, dtype=np.float32)
+             onehot[label] = 1
+             label = onehot
++        else:
++            label = np.array([label])
+         return label.copy()
+ 
+     def get_details(self, idx):
+@@ -254,10 +262,8 @@ class ImageFolderDataset(BaseImageDataset):
+     def __init__(self,
+         path,                   # Path to directory or zip.
+         resolution = None,      # Ensure specific resolution, None = highest available.
+-        crop_image = False,     # default: assumes inputs are square images, if True it will perform a random crop
+         **super_kwargs,         # Additional arguments for the Dataset base class.
+     ):
+-        self.crop_image = crop_image
+         self.is_patch = False
+         super().__init__(path=path, resolution=resolution,  **super_kwargs)
+ 
+@@ -269,16 +275,6 @@ class ImageFolderDataset(BaseImageDataset):
+             else:
+                 image = PIL.Image.open(f).convert('RGB')
+                 w, h = image.size
+-                if self.crop_image and w != h:
+-                    # perform random crop if needed
+-                    min_size = min(w, h)
+-                    if w == min_size:
+-                        x_start = 0
+-                        y_start = random.randint(0, h - min_size)
+-                    else:
+-                        x_start = random.randint(0, w - min_size)
+-                        y_start = 0
+-                    image = image.crop((x_start, y_start, x_start+min_size, y_start+min_size))
+                 if resize:
+                     # at this point it should be square
+                     assert(image.size[0] == image.size[1])
+@@ -362,3 +358,61 @@ class ImagePatchDataset(BaseImageDataset):
+             'params': params,
+         }
+         return data
++
++
++
++class MultiscaleImageFolderDataset(ImageFolderDataset):
++    def __init__(self, **super_kwargs):
++        super().__init__(**super_kwargs)
++
++    # make sure that labels are not converted into one-hot vectors
++    def _load_raw_labels(self):
++        fname = 'dataset.json'
++        if fname not in self._all_fnames:
++            return None
++        with self._open_file(fname) as f:
++            labels = json.load(f)['labels']
++        
++        assert(labels), "Scale labels not found."
++        
++        labels = dict(labels)
++        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
++        labels = np.array(labels)
++        labels = labels.astype(np.float32)
++        return labels
++
++    @property
++    def label_shape(self):
++        if self._label_shape is None:
++            self._label_shape = (1,)
++        return list(self._label_shape)
++
++    # get min and max scales in dataset
++    def scale_range(self):
++        raw_labels = self._get_raw_labels()
++        min_scale = np.min(raw_labels)
++        max_scale = np.max(raw_labels)
++        return min_scale, max_scale
++        
++    # count images per scale
++    def count_scale_labels(self):
++        flat_labels = self._get_raw_labels().flatten()
++        distinct_scales = set(flat_labels)
++        scale_count = {}
++        for s in distinct_scales:
++            scale_count[s] = np.count_nonzero(flat_labels == s)
++        return scale_count
++    
++    def sort_dataset_by_label(self):
++        raw_labels = self._get_raw_labels()
++        sorted_indices = sorted(range(len(raw_labels)), key=raw_labels.__getitem__)
++        sorted_raw_labels = np.array([raw_labels[i] for i in sorted_indices])
++        sorted_raw_idx = np.array([self._raw_idx[i] for i in sorted_indices])
++        self._set_raw_labels(sorted_raw_labels)
++        self._set_raw_idx(sorted_raw_idx)
++
++    def floor_labels(self):
++        raw_labels = self._get_raw_labels()
++        raw_labels_floored = np.floor(np.clip(raw_labels, 0, max(raw_labels)-0.001))
++        self._set_raw_labels(raw_labels_floored)
++
+diff --git a/training/loss.py b/training/loss.py
+index 9355562..7b94dde 100644
+--- a/training/loss.py
++++ b/training/loss.py
+@@ -19,6 +19,9 @@ from metrics import equivariance
+ from util import losses, util, patch_util
+ import random
+ 
++# added imports for multiscale consistency loss
++from util.misc import isotropic_scaling_matrix_2D_torch
++
+ #----------------------------------------------------------------------------
+ 
+ class Loss:
+@@ -40,10 +43,62 @@ def apply_affine_batch(img, transform):
+     masks = torch.cat(masks, dim=0)
+     return crops, masks
+ 
++def apply_affine_batch_and_fix_mask(img, transform, mode='replicate'):
++    # hacky .. apply affine transformation with cuda kernel in batch form
++    crops = []
++    masks = []
++    for i, t in zip(img, transform):
++        crop, mask = equivariance.apply_affine_transformation(
++            i[None], t.inverse())
++        mask = fix_mask_with_scale_matrix(mask, t)
++        crops.append(crop)
++        masks.append(mask)
++    crops = torch.cat(crops, dim=0)
++    masks = torch.cat(masks, dim=0)
++    return crops, masks
++
++def apply_simplified_affine_batch_and_fix_mask(img, transform, mode='constant'):
++    # hacky .. apply affine transformation with cuda kernel in batch form
++    crops = []
++    masks = []
++    for i, t in zip(img, transform):
++        crop, mask = equivariance.apply_simplified_affine_transformation(
++            i[None], t.inverse(), mode=mode)
++        mask = fix_mask_with_scale_matrix(mask, t)
++        crops.append(crop)
++        masks.append(mask)
++    crops = torch.cat(crops, dim=0)
++    masks = torch.cat(masks, dim=0)
++    return crops, masks
++
++def fix_mask(mask, scale):
++    mask = torch.zeros_like(mask)
++    mask_width = mask.shape[2]
++    half_mask_width = mask_width // 2
++    ratio = 1/scale
++    margin = int(half_mask_width - np.floor(half_mask_width * ratio))
++    mask[:, :, margin:-margin, margin:-margin] = 1
++    return mask
++
++def fix_mask_with_scale_matrix(mask, scale_matrix):
++    scale = scale_matrix[0][0]
++    if scale <= 1:
++        mask = torch.ones_like(mask)
++        return mask
++    else:
++        mask = torch.zeros_like(mask)
++        mask_width = mask.shape[2]
++        half_mask_width = mask_width // 2
++        ratio = 1/scale
++        margin = int(half_mask_width - np.floor(half_mask_width * ratio.cpu()))
++        mask[:, :, margin:-margin, margin:-margin] = 1
++        return mask
++
++
+ class StyleGAN2Loss(Loss):
+     def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2,
+                  pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0,
+-                 blur_fade_kimg=0, teacher=None, added_kwargs=None):
++                 blur_fade_kimg=0, added_kwargs=None):
+         super().__init__()
+         self.device             = device
+         self.G                  = G
+@@ -59,14 +114,14 @@ class StyleGAN2Loss(Loss):
+         self.blur_init_sigma    = blur_init_sigma
+         self.blur_fade_kimg     = blur_fade_kimg
+ 
+-        self.teacher = teacher
+         self.added_kwargs = added_kwargs
+         self.training_mode = self.G.training_mode
+-        if self.teacher is not None:
+-            self.loss_l1 = losses.Masked_L1_Loss().to(device)
+-            self.loss_lpips = losses.Masked_LPIPS_Loss(net='alex', device=device)
+-            util.set_requires_grad(False, self.loss_lpips)
+-            util.set_requires_grad(False, self.teacher)
++        if self.added_kwargs is not None:
++            if self.added_kwargs.consistency_mode == 'multiscale_forward' or self.added_kwargs.consistency_mode == 'multiscale_inverse':
++                self.loss_l1 = losses.Masked_L1_Loss().to(device)
++                if self.added_kwargs.consistency_loss_select == 'both':
++                    self.loss_lpips = losses.Masked_LPIPS_Loss(net='alex', device=device)
++                    util.set_requires_grad(False, self.loss_lpips)
+ 
+     def style_mix(self, z, c, ws):
+         if self.style_mixing_prob > 0:
+@@ -79,31 +134,16 @@ class StyleGAN2Loss(Loss):
+     def run_G(self, z, c, transform, update_emas=False):
+         mapped_scale = None
+         crop_fn = None
+-        if 'patch' in self.training_mode:
+-            ws = self.G.mapping(z, c, update_emas=update_emas)
+-            scale, mapped_scale = patch_util.compute_scale_inputs(self.G, ws, transform)
+-            ws = self.style_mix(z, c, ws)
+-            img = self.G.synthesis(ws, mapped_scale=mapped_scale, transform=transform, update_emas=update_emas)
+-        elif '360' in self.training_mode:
+-            ws = self.G.mapping(z, c, update_emas=update_emas)
+-            ws = self.style_mix(z, c, ws)
+-            input_layer = self.G.synthesis.input
+-            crop_start = random.randint(0, 360 // input_layer.fov * input_layer.frame_size[0] - 1)
+-            crop_fn = lambda grid : grid[:, :, crop_start:crop_start+input_layer.size[0], :]
+-            img_base = self.G.synthesis(ws, crop_fn=crop_fn, update_emas=update_emas)
+-            crop_shift = crop_start + input_layer.frame_size[0]
+-            # generate shifted frame for cross-frame discriminator
+-            crop_fn_shift = lambda grid : grid[:, :, crop_shift:crop_shift+input_layer.size[0], :]
+-            img_shifted = self.G.synthesis(ws, crop_fn=crop_fn_shift, update_emas=update_emas)
+-            img_splice = torch.cat([img_base, img_shifted], dim=3)
+-            img_size = img_base.shape[-1]
+-            splice_start = random.randint(0, img_size)
+-            img = img_splice[:, :, :, splice_start:splice_start+img_size]
+-        elif 'global' in self.training_mode:
++        if 'global' in self.training_mode:
+             ws = self.G.mapping(z, c, update_emas=update_emas)
+             ws = self.style_mix(z, c, ws)
+             assert(transform is None)
+             img = self.G.synthesis(ws, transform=transform, update_emas=update_emas)
++        elif 'multiscale' in self.training_mode:
++            ws = self.G.mapping(z, c, update_emas=update_emas)
++            scale, mapped_scale = patch_util.compute_scale_inputs(self.G, ws, transform, c)
++            ws = self.style_mix(z, c, ws)
++            img = self.G.synthesis(ws, mapped_scale=mapped_scale, transform=transform, update_emas=update_emas)
+         return img, ws
+ 
+     def run_D(self, img, c, blur_sigma=0, update_emas=False):
+@@ -130,48 +170,99 @@ class StyleGAN2Loss(Loss):
+         if phase in ['Gmain', 'Gboth']:
+             with torch.autograd.profiler.record_function('Gmain_forward'):
+                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, transform)
+-                # vutils.save_image(gen_img, 'out_fake_patch.png', range=(-1, 1),
+-                #                   normalize=True, nrow=4)
+                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
+                 training_stats.report('Loss/scores/fake', gen_logits)
+                 training_stats.report('Loss/signs/fake', gen_logits.sign())
+-                loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
++                loss_Gmain = torch.nn.functional.softplus(-gen_logits)
+                 training_stats.report('Loss/G/loss', loss_Gmain)
+                 training_stats.report('Scale/G/min_scale', min_scale)
+                 training_stats.report('Scale/G/max_scale', max_scale)
+-                if self.teacher is not None and self.added_kwargs.teacher_lambda > 0:
+-                    teacher_img = self.teacher(gen_z, gen_c)
+-                    if self.added_kwargs.teacher_mode == 'forward':
+-                        teacher_crop, teacher_mask = apply_affine_batch(teacher_img, transform)
+-                        # removes the border around the above mask 
+-                        # (mask should be all ones bc zooming in)
+-                        teacher_mask = torch.ones_like(teacher_mask)
+-                        l1_loss = self.loss_l1(gen_img, teacher_crop,
+-                                               teacher_mask[:, :1])
+-                        lpips_loss = self.loss_lpips(
+-                            losses.adaptive_downsample256(gen_img),
+-                            losses.adaptive_downsample256(teacher_crop),
+-                            losses.adaptive_downsample256(teacher_mask[:, :1],
+-                                                       mode='nearest')
+-                        )
+-                    elif self.added_kwargs.teacher_mode == 'inverse':
+-                        out_crop, out_mask = apply_affine_batch(gen_img, transform.inverse())
+-                        l1_loss = self.loss_l1(out_crop, teacher_img,
+-                                               out_mask[:, :1])
+-                        lpips_loss = self.loss_lpips(
+-                            losses.adaptive_downsample256(out_crop),
+-                            losses.adaptive_downsample256(teacher_img),
+-                            losses.adaptive_downsample256(out_mask[:, :1],
+-                                                       mode='nearest')
+-                        )
+-                    else:
+-                        assert(False)
+-                    teacher_loss = (l1_loss + lpips_loss)[:, None]
+-                    loss_Gmain = (loss_Gmain + self.added_kwargs.teacher_lambda
+-                                  * teacher_loss)
++                
++                # multiscale consistency fork
++                if (self.added_kwargs.consistency_mode == 'multiscale_forward' or self.added_kwargs.consistency_mode == 'multiscale_inverse') and self.added_kwargs.consistency_lambda > 0:
++                    
++                    batch_size = transform.shape[0]
++
++                    consistency_scale_min = self.added_kwargs.consistency_scale_min
++                    consistency_scale_max = self.added_kwargs.consistency_scale_max
++                    scaling_factors = torch.rand(batch_size) * (consistency_scale_max - consistency_scale_min) + consistency_scale_min
++
++                    # allowing scale for the scale consistency reference to go out of bound (zoom out more than the coarsest scale)
++                    if(self.added_kwargs.consistency_scale_sampling == 'unbounded'):
++                        pass
++                    # beta distribution mentioned in the paper
++                    elif(self.added_kwargs.consistency_scale_sampling == 'beta'):
++                        original_scale_factors = transform[:,0,0]
++                        original_scale_factors_log = torch.log2(1/original_scale_factors)
++                        n_mags = torch.clamp(original_scale_factors_log, min=1)
++                        mode = 1/n_mags
++                        mode_reduce = 1/(n_mags/torch.sqrt(n_mags))
++                        alpha = torch.sqrt(1/mode_reduce)
++                        beta = (alpha - 1 - mode * alpha + mode * 2)/mode
++                        scaling_factors = torch.distributions.beta.Beta(alpha, beta).sample()
++                        scaling_factors = 2**(scaling_factors * original_scale_factors_log).cpu()
++                        pass
++                    # scale is sampled uniformly
++                    elif(self.added_kwargs.consistency_scale_sampling == 'uniform'):
++                        original_scale_factors = transform[:,0,0].cpu()
++                        original_scale_factors_log = torch.log2(1/original_scale_factors)
++                        consistency_scale_min_log = np.log2(consistency_scale_min)
++                        consistency_scale_max_log = np.log2(consistency_scale_max)
++                        normalization_min = torch.clamp(original_scale_factors_log, max=consistency_scale_min_log)
++                        normalization_max = torch.clamp(original_scale_factors_log, max=consistency_scale_max_log) - normalization_min
++                        alpha = beta = torch.ones_like(original_scale_factors)
++                        scaling_factors_pre = torch.distributions.beta.Beta(alpha, beta).sample()
++                        scaling_factors = 2**(scaling_factors_pre * normalization_max + normalization_min).cpu()
++                        pass
++                    
++
++                    scaling_matrices = isotropic_scaling_matrix_2D_torch(scaling_factors).to(self.device)
++                    scaling_matrices_inverted = isotropic_scaling_matrix_2D_torch(1/scaling_factors).to(self.device)
++                    transform_mod = torch.bmm(transform, scaling_matrices)
++
++                    teacher_c = torch.log2(1/transform_mod[:,0,0]).unsqueeze(1)
++                    teacher_img, _gen_ws = self.run_G(gen_z, teacher_c, transform_mod)
++
++                    if self.added_kwargs.random_gradient_off:
++                        disbale_student = bool(random.getrandbits(1))
++                        if disbale_student:
++                            gen_img = gen_img.detach()
++                        else:
++                            teacher_img = teacher_img.detach()
++
++                    # forward scale consistency
++                    if self.added_kwargs.consistency_mode == 'multiscale_forward':
++                        #computing L1
++                        teacher_crop, teacher_mask = apply_affine_batch_and_fix_mask(teacher_img, scaling_matrices_inverted)
++                        l1_loss = self.loss_l1(gen_img, teacher_crop, teacher_mask[:, :1])                        
++                        teacher_loss = l1_loss[:, None] 
++                        
++                        #computing LPIPS if chosen
++                        if self.added_kwargs.consistency_loss_select == 'both':
++                            lpips_loss = self.loss_lpips(losses.adaptive_downsample256(gen_img), losses.adaptive_downsample256(teacher_crop), losses.adaptive_downsample256(teacher_mask[:, :1], mode='nearest')                    )
++                            teacher_loss = (l1_loss + lpips_loss)[:, None]                                                             
++                            training_stats.report('Loss/G/loss_teacher_lpips', lpips_loss)
++
++                    # inverse scale consistency
++                    elif self.added_kwargs.consistency_mode == 'multiscale_inverse':
++                        #computing L1
++                        gen_crop, gen_mask = apply_simplified_affine_batch_and_fix_mask(gen_img, scaling_matrices)
++                        teacher_img = teacher_img * gen_mask
++                        gen_crop = gen_crop * gen_mask
++                        l1_loss = self.loss_l1(gen_crop, teacher_img, gen_mask[:, :1])
++                        teacher_loss = l1_loss[:, None]
++
++                        #computing LPIPS if chosen
++                        if self.added_kwargs.consistency_loss_select == 'both':
++                            lpips_loss = self.loss_lpips(losses.adaptive_downsample256(gen_crop), losses.adaptive_downsample256(teacher_img), losses.adaptive_downsample256(gen_mask[:, :1], mode='nearest')                    )
++                            teacher_loss = (l1_loss + lpips_loss)[:, None]                                             
++                            training_stats.report('Loss/G/loss_teacher_lpips', lpips_loss)
++
++                    # computing final loss_Gmain value and reproting 
++                    loss_Gmain = (loss_Gmain + self.added_kwargs.consistency_lambda * teacher_loss)   
+                     training_stats.report('Loss/G/loss_teacher_l1', l1_loss)
+-                    training_stats.report('Loss/G/loss_teacher_lpips', lpips_loss)
+                     training_stats.report('Loss/G/loss_total', loss_Gmain)
++
+             with torch.autograd.profiler.record_function('Gmain_backward'):
+                 loss_Gmain.mean().mul(gain).backward()
+ 
+diff --git a/training/networks_stylegan3.py b/training/networks_stylegan3.py
+index eabfc05..e939714 100644
+--- a/training/networks_stylegan3.py
++++ b/training/networks_stylegan3.py
+@@ -21,6 +21,8 @@ from torch_utils.ops import bias_act
+ import math
+ import random
+ 
++import dnnlib
++
+ #----------------------------------------------------------------------------
+ 
+ @misc.profiled_function
+@@ -116,7 +118,7 @@ class MappingNetwork(torch.nn.Module):
+         num_ws,                     # Number of intermediate latents to output.
+         num_layers      = 2,        # Number of mapping layers.
+         lr_multiplier   = 0.01,     # Learning rate multiplier for the mapping layers.
+-        w_avg_beta      = 0.998,    # Decay for tracking the moving average of W during training.
++        w_avg_beta      = 0.998    # Decay for tracking the moving average of W during training.
+     ):
+         super().__init__()
+         self.z_dim = z_dim
+@@ -160,6 +162,8 @@ class MappingNetwork(torch.nn.Module):
+         x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+         if truncation_psi != 1:
+             x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
++        
++               
+         return x
+ 
+     def extra_repr(self):
+@@ -199,7 +203,7 @@ class SynthesisInput(torch.nn.Module):
+         self.register_buffer('freqs', freqs)
+         self.register_buffer('phases', phases)
+ 
+-    def forward(self, w, transform=None, **kwargs):
++    def forward(self, w, transform=None, factor=1, **kwargs):
+         # Introduce batch dimension.
+         if transform is None:
+             # sanity check; should not modify transform from identity
+@@ -208,7 +212,7 @@ class SynthesisInput(torch.nn.Module):
+         freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
+         phases = self.phases.unsqueeze(0) # [batch, channel]
+ 
+-        # Apply learned transformation.
++        # Apply learned transformation
+         t = self.affine(w) # t = (r_c, r_s, t_x, t_y)
+         t = t / t[:, :2].norm(dim=1, keepdim=True) # t' = (r'_c, r'_s, t'_x, t'_y)
+         m_r = torch.eye(3, device=w.device).unsqueeze(0).repeat([w.shape[0], 1, 1]) # Inverse rotation wrt. resulting image.
+@@ -255,118 +259,198 @@ class SynthesisInput(torch.nn.Module):
+             f'sampling_rate={self.sampling_rate:g}, bandwidth={self.bandwidth:g}'])
+ 
+ 
++#----------------------------------------------------------------------------
++
+ @persistence.persistent_class
+-class SynthesisInput360(torch.nn.Module):
++class MultiscaleSynthesisInput(torch.nn.Module):
+     def __init__(self,
+         w_dim,          # Intermediate latent (W) dimensionality.
+         channels,       # Number of output channels.
+         size,           # Output spatial size: int or [width, height].
+         sampling_rate,  # Output sampling rate.
+         bandwidth,      # Output bandwidth.
+-        margin_size,    # Extra margin on input.
+-        fov,            # panorama FOV.
++        margin_size,    # Extra margin on input.        
++        n_redist_layers,
++        last_redist_layer,
++        distribution_threshold,
++        scale_count_fixed,
++        n_bins,
++        bin_transform_offset,
++        bin_blend_width,
++        bin_blend_offset,
++        scale_count             = 1,
++        progressive_freqs       = False,
++        all_sizes               = None,
++        all_cutoffs       = None,
++        **aux_kwargs
+     ):
+         super().__init__()
+         self.w_dim = w_dim
+-        self.channels = channels
+-        self.fov = fov
++        self.channels = channels     
+         self.size = np.broadcast_to(np.asarray(size), [2])
+         self.sampling_rate = sampling_rate
+         self.bandwidth = bandwidth
+         self.margin_size = margin_size
+-        self.frame_size = self.size - 2 * self.margin_size
+-
+-        # Draw random frequencies from uniform 2D disc.
++        self.n_redist_layers = n_redist_layers
++        self.last_redist_layer = last_redist_layer
++        self.distribution_threshold = distribution_threshold
++        self.scale_count_fixed = scale_count_fixed
++        self.n_bins = n_bins
++        self.bin_transform_offset = bin_transform_offset
++        self.bin_blend_width = bin_blend_width
++        self.bin_blend_offset = bin_blend_offset
++        self.scale_count = scale_count
++        self.progressive_freqs = progressive_freqs
++        
++        self.sizes = all_sizes
++        self.cutoffs = all_cutoffs
++
++        # Modfiy scale count according to arguments
++        if(scale_count_fixed > 0):
++            scale_count = scale_count_fixed
++
++        # sampling frequencies and phases
++        num_points = int(self.channels)
+         freqs = torch.randn([self.channels, 2])
+-        radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
+-        freqs /= radii * radii.square().exp().pow(0.25)
++        radii = freqs.square().sum(dim=1, keepdim=True).sqrt()            
++        new_radii = torch.linspace(1.0/num_points, 1, num_points, )
++        freqs /= radii
++        freqs *= torch.cat((new_radii.unsqueeze(1), new_radii.unsqueeze(1)), 1)
+         freqs *= bandwidth
++        if self.progressive_freqs:
++            freqs *= 2**(scale_count)
+         phases = torch.rand([self.channels]) - 0.5
+ 
++        # Sorting freqs and phases so they can be properly redistributed among differnt syntesis layers
++        radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
++        sorted_radii, indices = torch.sort(radii, dim=0, descending=False)
++        freqs = freqs[indices.squeeze(1)]
++        phases = phases[indices.squeeze(1)]
++
++        # Finding indices of frequencies that need to be redistributed among layers
++        self.split_indices = ()
++        self.concat_layers = [False for i in range(len(self.sizes)+1)]
++        threshold_factor = distribution_threshold
++        
++        # Indices for synthesis input
++        self.split_indices += ((sorted_radii < self.sizes[0]/threshold_factor).nonzero(as_tuple=True)[0],)
++        
++        # Indices for intermediate layers
++        for i in range(len(self.sizes)):
++            previous_size = self.sizes[i-1]/threshold_factor
++            curent_size = self.sizes[i]/threshold_factor
++            if i < last_redist_layer:
++                self.split_indices += (((sorted_radii > previous_size) * (sorted_radii < curent_size)).nonzero(as_tuple=True)[0],)
++                previous_size = curent_size
++            elif i == last_redist_layer:
++                self.split_indices += ((sorted_radii > previous_size).nonzero(as_tuple=True)[0],)
++            else:
++                self.split_indices += (torch.empty(0),)
++        self.concat_layers = [len(self.split_indices[i]) != 0 for i in range(len(self.split_indices))]
++
+         # Setup parameters and buffers.
+-        self.weight = torch.nn.Parameter(torch.randn([self.channels, self.channels]))
++        self.weight = torch.nn.Parameter(torch.randn([len(self.split_indices[0]), len(self.split_indices[0])]))
++        self.weights = torch.nn.ParameterList([torch.nn.Parameter(torch.randn(0, 0)) for i in range(len(self.split_indices))])
++
+         self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
+         self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
+         self.register_buffer('freqs', freqs)
+         self.register_buffer('phases', phases)
+ 
+-    def forward(self, w, transform=None, crop_fn=None):
++    def rasterize_freqs(self, layer, out_size, transform, w, factor, freqs=None, phases=None):
++        return self.forward(w, transform=transform, layer=layer, out_size=out_size, factor=factor, freqs=freqs, phases=phases)
++
++    def forward(self, w, transform=None, layer=0, out_size=0, factor=1, freqs=None, phases=None, **kwargs):
++        
++        early_return = True if freqs is not None else False
++
+         # Introduce batch dimension.
+         if transform is None:
+-            transforms = self.transform.unsqueeze(0) # [batch, row, col]
+-        else:
+-            transforms = transform
+-        freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
+-        phases = self.phases.unsqueeze(0) # [batch, channel]
++            # Sanity check; should not modify transform from identity
++            assert(torch.equal(self.transform, torch.eye(3, 3).to(self.transform.device)))
++            transform = self.transform.unsqueeze(0) # [batch, row, col]
++            
++        layer_split_indices = self.split_indices[layer]
+ 
+-        # does not add learned rotation for 360 model
+-        transforms = transforms.expand(w.shape[0], -1, -1)
++        if layer_split_indices.nelement() == 0 and freqs is None:
++            return None, None
++        
++        if freqs is None:
++            freqs = self.freqs[layer_split_indices,:].unsqueeze(0) # [batch, channel, xy]
++            phases = self.phases[layer_split_indices].unsqueeze(0) # [batch, channel]
+ 
+-        # Dampen out-of-band frequencies that may occur due to the user-specified transform.
+-        amplitudes = (1 - (freqs.norm(dim=2) - self.bandwidth) / (self.sampling_rate / 2 - self.bandwidth)).clamp(0, 1)
++        if self.n_bins > 1: # Do when frequency binning is used
++            indices = torch.arange(0, freqs.shape[1], device=freqs.device) % self.n_bins
++            indices_unsquuezed = indices.unsqueeze(1).unsqueeze(0)
++            freqs *= 2**(indices_unsquuezed*self.bin_transform_offset)
++
++        # Layer Redistirbution prep
++        if layer == 0:
++            out_size = self.size[1]
++
++        m_t = torch.eye(3, device=w.device).unsqueeze(0).repeat([w.shape[0], 1, 1])
++        transforms = m_t @ transform
++
++        # Transform frequencies.
++        t_fac = np.sqrt(factor)#*float(out_size/36.0)
++
++        phases = phases + (freqs @ (t_fac*transforms[:, :2, 2:])).squeeze(2)
++        freqs = freqs @ transforms[:, :2, :2]
++        amplitudes = self.compute_amplitudes(freqs)
+ 
+         # Construct sampling grid.
+         theta = torch.eye(2, 3, device=w.device)
+-        theta[0, 0] = 0.5 * self.size[0] / self.sampling_rate # tx
+-        theta[1, 1] = 0.5 * self.size[1] / self.sampling_rate # ty
+-        grid_width = self.frame_size[0] * 360 // self.fov + 2 * self.margin_size
+-        grids = torch.nn.functional.affine_grid(theta.unsqueeze(0),
+-                                                [1, 1, self.size[1], grid_width],
+-                                                align_corners=False)
+-        # extended grid to ensure that the x coordinate completes a full circle without padding
+-        base_width = grid_width - 2*self.margin_size
+-        corrected_x = torch.arange(-self.margin_size, base_width*2+self.margin_size, device=grids.device) / base_width  * 2 - 1
+-        corrected_y = grids[0, :, 0, 1]
+-        corrected_grids = torch.cat([corrected_x.view(1, 1, -1, 1).repeat(1, self.size[1], 1, 1),
+-                                     corrected_y.view(1, -1, 1, 1).repeat(1, 1, grid_width+base_width, 1)], dim=3)
+-        grids = corrected_grids
+-
+-        if crop_fn is None:
+-            crop_start = random.randint(0, base_width - 1)
+-            grids = grids[:, :, crop_start:crop_start+self.size[1], :]
+-        else:
+-            grids = crop_fn(grids)
+-
+-        # apply transformation first
+-        rotation = transforms[:, :2, :2]
+-        translation = transforms[:, :2, 2:].squeeze(2)
+-        # normalize grid x s.t. transformations can operate on square affine ratio
+-        grids_normalized = grids.clone()
+-        min_bound = torch.min(grids_normalized[:, :, :, 0])
+-        max_bound = torch.max(grids_normalized[:, :, :, 0])
+-        target_range = torch.max(grids_normalized[:, :, :, 1]) - torch.min(grids_normalized[:, :, :, 1])
+-        grids_normalized[:, :, :, 0] = (grids_normalized[:, :, :, 0] - min_bound) / (max_bound - min_bound)
+-        grids_normalized[:, :, :, 0] = grids_normalized[:, :, :, 0] * target_range - target_range / 2
+-        # # xT @ RT = (Rx)T --> it is transposed
+-        grids_transformed = (grids_normalized.unsqueeze(3) @ rotation.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3)
+-        grids_transformed = grids_transformed + translation.unsqueeze(1).unsqueeze(2)
+-        grids_transformed[:, :, :, 0] = (grids_transformed[:, :, :, 0] + target_range / 2) / target_range * (max_bound - min_bound) + min_bound
+-
+-        # map discontinuous x-angle to continuous cylindrical coordinate
+-        grids_transformed_sin = grids_transformed.clone()
+-        grids_transformed_cos = grids_transformed.clone()
+-        grids_transformed_sin[:, :, :, 0] = torch.sin(grids_transformed_sin[:, :, :, 0] * torch.tensor(math.pi))
+-        grids_transformed_cos[:, :, :, 0] = torch.cos(grids_transformed_cos[:, :, :, 0] * torch.tensor(math.pi))
+-
+-        x_sin = (grids_transformed_sin.unsqueeze(3) @ freqs[:, :self.channels//2, :].permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
+-        x_sin = x_sin + phases[:, :self.channels//2].unsqueeze(1).unsqueeze(2)
+-        x_sin = torch.sin(x_sin * (np.pi * 2))
+-        x_sin = x_sin * amplitudes[:, :self.channels//2].unsqueeze(1).unsqueeze(2)
+-        x_cos = (grids_transformed_cos.unsqueeze(3) @ freqs[:, self.channels//2:, :].permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
+-        x_cos = x_cos + phases[:, self.channels//2:].unsqueeze(1).unsqueeze(2)
+-        x_cos = torch.sin(x_cos * (np.pi * 2))
+-        x_cos = x_cos * amplitudes[:, self.channels//2:].unsqueeze(1).unsqueeze(2)
+-        x = torch.cat([x_sin, x_cos], dim=-1)
++        theta[0, 0] = 0.5 
++        theta[1, 1] = 0.5 
++        grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, out_size, out_size], align_corners=True)
+ 
+-        # Apply trainable mapping.
+-        weight = self.weight / np.sqrt(self.channels)
+-        x = x @ weight.t()
++        # Compute Fourier features.
++        x = (grids.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
++        x = x + phases.unsqueeze(1).unsqueeze(2)
++        x = torch.sin(x * (np.pi * 2))
++
++        if self.n_bins > 1: # Do when frequency binning is used
++            scaling = transform[:,0,0]
++            scaling_log = torch.log2(1/scaling)
++            scaling_log_unsqueezed = scaling_log.unsqueeze(1).repeat(1,indices.shape[0])
++            amplitudes_pre = (1/self.bin_blend_width) * (scaling_log_unsqueezed - (indices.unsqueeze(0)*self.bin_transform_offset) - self.bin_blend_offset)
++            mask = (indices.unsqueeze(0) == 0).repeat(amplitudes_pre.shape[0],1)
++            amplitudes_pre[mask] = 1 # all frequencies from the first bin should be always active
++            bins_amplitudes = torch.clamp(amplitudes_pre, min=0, max=1)
++            x = x * bins_amplitudes.unsqueeze(1).unsqueeze(2)
++
++        if early_return:
++            return x.permute(0, 3, 1, 2), amplitudes
++
++        # Apply trainable mapping.           
++        if layer == 0:
++            weight = self.weight / np.sqrt(self.weight.shape[0])
++            x = x @ weight.t()
++        else:
++            weight = self.weights[layer]
++            if weight.nelement() != 0:
++                weight = self.weights[layer] / np.sqrt(self.weights[layer].shape[0])
++                x = x @ weight.t()
+ 
+         # Ensure correct shape.
+         x = x.permute(0, 3, 1, 2) # [batch, channel, height, width]
+-        misc.assert_shape(x, [w.shape[0], self.channels, int(self.size[1]), int(self.size[0])])
+-        return x
++        misc.assert_shape(x, [w.shape[0], layer_split_indices.shape[0], int(out_size), int(out_size)])
++        return x, amplitudes
++
++    def compute_amplitudes(self, freqs):
++        
++        if self.progressive_freqs:
++            amplitudes = (1 - (freqs.norm(dim=2) - 2.) / (4. - 2.)).clamp(0, 1)
++        else:
++            # Dampen out-of-band frequencies that may occur due to the user-specified transform.
++            amplitudes = (1 - (freqs.norm(dim=2) - self.bandwidth) / (self.sampling_rate / 2 - self.bandwidth)).clamp(0, 1)
++        return amplitudes
++
+ 
++    def extra_repr(self):
++        return '\n'.join([
++            f'w_dim={self.w_dim:d}, channels={self.channels:d}, size={list(self.size)},',
++            f'sampling_rate={self.sampling_rate:g}, bandwidth={self.bandwidth:g}'])
+ 
+ #----------------------------------------------------------------------------
+ 
+@@ -381,6 +465,7 @@ class SynthesisLayer(torch.nn.Module):
+         # Input & output specifications.
+         in_channels,                    # Number of input channels.
+         out_channels,                   # Number of output channels.
++        out_channels_final,             # Number of output channels after concatenation.
+         in_size,                        # Input spatial size: int or [width, height].
+         out_size,                       # Output spatial size: int or [width, height].
+         in_sampling_rate,               # Input sampling rate (s).
+@@ -389,6 +474,7 @@ class SynthesisLayer(torch.nn.Module):
+         out_cutoff,                     # Output cutoff frequency (f_c).
+         in_half_width,                  # Input transition band half-width (f_h).
+         out_half_width,                 # Output Transition band half-width (f_h).
++        n_redist_layers,        
+ 
+         # Hyperparameters.
+         conv_kernel         = 3,        # Convolution kernel size. Ignored for final the ToRGB layer.
+@@ -399,7 +485,10 @@ class SynthesisLayer(torch.nn.Module):
+         magnitude_ema_beta  = 0.999,    # Decay rate for the moving average of input magnitudes. 
+ 
+         # added
+-        use_scale_affine = False
++        synthesis_input = None,
++        idx = 0,
++        
++        **aux_kwargs
+     ):
+         super().__init__()
+         self.w_dim = w_dim
+@@ -408,6 +497,7 @@ class SynthesisLayer(torch.nn.Module):
+         self.use_fp16 = use_fp16
+         self.in_channels = in_channels
+         self.out_channels = out_channels
++        self.out_channels_final = out_channels_final
+         self.in_size = np.broadcast_to(np.asarray(in_size), [2])
+         self.out_size = np.broadcast_to(np.asarray(out_size), [2])
+         self.in_sampling_rate = in_sampling_rate
+@@ -416,10 +506,13 @@ class SynthesisLayer(torch.nn.Module):
+         self.in_cutoff = in_cutoff
+         self.out_cutoff = out_cutoff
+         self.in_half_width = in_half_width
++        self.n_redist_layers = n_redist_layers
+         self.out_half_width = out_half_width
+         self.conv_kernel = 1 if is_torgb else conv_kernel
+         self.conv_clamp = conv_clamp
+         self.magnitude_ema_beta = magnitude_ema_beta
++        self.synthesis_input = synthesis_input
++        self.idx = idx
+ 
+         # Setup parameters and buffers.
+         self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
+@@ -450,12 +543,7 @@ class SynthesisLayer(torch.nn.Module):
+         pad_hi = pad_total - pad_lo
+         self.padding = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
+ 
+-        # added
+-        self.use_scale_affine = use_scale_affine
+-        if self.use_scale_affine:
+-            self.scale_affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=0)
+-
+-    def forward(self, x, w, scale=None, noise_mode='random', force_fp32=False, update_emas=False):
++    def forward(self, x, w, scale=None, transform=None, w_input=None, factor=1, noise_mode='random', force_fp32=False, update_emas=False):
+         assert noise_mode in ['random', 'const', 'none'] # unused
+         misc.assert_shape(x, [None, self.in_channels, int(self.in_size[1]), int(self.in_size[0])])
+         misc.assert_shape(w, [x.shape[0], self.w_dim])
+@@ -469,11 +557,6 @@ class SynthesisLayer(torch.nn.Module):
+ 
+         # Execute affine layer.
+         styles = self.affine(w)
+-        # added here
+-        if self.use_scale_affine:
+-            assert(scale is not None)
+-            styles_scale = self.scale_affine(scale)
+-            styles = styles + styles_scale # equivalent to concatenation
+ 
+         if self.is_torgb:
+             weight_gain = 1 / np.sqrt(self.in_channels * (self.conv_kernel ** 2))
+@@ -489,9 +572,15 @@ class SynthesisLayer(torch.nn.Module):
+         slope = 1 if self.is_torgb else 0.2
+         x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.down_filter, b=self.bias.to(x.dtype),
+             up=self.up_factor, down=self.down_factor, padding=self.padding, gain=gain, slope=slope, clamp=self.conv_clamp)
++        
++        # Insert raw frequencies
++        concat_freqs, _ = self.synthesis_input.rasterize_freqs(self.idx+1, self.out_size[0], transform, w, factor)
++        if not (concat_freqs==None):
++            concat_freqs = concat_freqs.to(dtype=dtype)
++            x = torch.cat((x, concat_freqs), dim=1)
+ 
+         # Ensure correct shape and dtype.
+-        misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
++        misc.assert_shape(x, [None, self.out_channels_final, int(self.out_size[1]), int(self.out_size[0])])
+         assert x.dtype == dtype
+         return x
+ 
+@@ -547,7 +636,10 @@ class SynthesisNetwork(torch.nn.Module):
+         output_scale        = 0.25,     # Scale factor for the output image.
+         num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
+         training_mode       = 'global', # training mode for input layer
+-        fov                 = None,     # Specify FOV for 360 model
++        auto_last_redist_layer = False, # Decided whether last redist layer shoudl be set automatically
++        scale_count         = 1,
++        progressive_freqs   = False,
++        scale_mapping_kwargs = None,
+         **layer_kwargs,                 # Arguments for SynthesisLayer.
+     ):
+         super().__init__()
+@@ -561,6 +653,16 @@ class SynthesisNetwork(torch.nn.Module):
+         self.output_scale = output_scale
+         self.num_fp16_res = num_fp16_res
+ 
++        self.training_mode = training_mode
++
++        self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
++
++
++        self.scale_mapping_kwargs = scale_mapping_kwargs
++
++        self.base_image_sampled = None
++        self.synthesised_content = None 
++
+         # Geometric progression of layer cutoffs and min. stopbands.
+         last_cutoff = self.img_resolution / 2 # f_{c,N}
+         last_stopband = last_cutoff * last_stopband_rel # f_{t,N}
+@@ -574,59 +676,125 @@ class SynthesisNetwork(torch.nn.Module):
+         sizes = sampling_rates + self.margin_size * 2
+         sizes[-2:] = self.img_resolution
+         channels = np.rint(np.minimum((channel_base / 2) / cutoffs, channel_max))
++
++        if progressive_freqs:
++            channels[0:layer_kwargs['last_redist_layer']+1] = channel_max
++
++        # set last layer n_channels to 3 for image ouput
+         channels[-1] = self.img_channels
++        
++        self.sizes = sizes
++
++        if auto_last_redist_layer:
++            layer_kwargs['last_redist_layer'] = np.where(sizes == np.max(sizes))[0][0]
++
++        # increase number of channels for SynthesisInputLayer
++        synthesis_input_n_channels = channels[0]
+ 
+         # Construct layers.
+-        if '360' not in training_mode:
+-            self.input = SynthesisInput(
+-                w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
++        if 'multiscale' in training_mode:
++            self.input = MultiscaleSynthesisInput(
++                w_dim=self.w_dim, channels=int(synthesis_input_n_channels), size=int(sizes[0]),
+                 sampling_rate=sampling_rates[0], bandwidth=cutoffs[0],
+-                margin_size=margin_size)
++                margin_size=margin_size,
++                scale_count=scale_count,
++                progressive_freqs=progressive_freqs,
++                all_sizes = sizes,
++                all_cutoffs = cutoffs,
++                **layer_kwargs)
+         else:
+-            assert(fov is not None)
+-            self.input = SynthesisInput360(
+-                w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
++            self.input = SynthesisInput(
++                w_dim=self.w_dim, channels=int(synthesis_input_n_channels), size=int(sizes[0]),
+                 sampling_rate=sampling_rates[0], bandwidth=cutoffs[0],
+-                margin_size=margin_size, fov=fov)
++                margin_size=margin_size)
++        
++        if len(self.input.freqs) > 1024:
++            channels[10] = channels[9] = channels[8]
++
++        # Redefine channel numbers per layer
++        cum_channels = len(self.input.split_indices[0])
++        for i in range(len(channels)):
++            if i==0 or len(self.input.split_indices[i+1])>0:
++                cum_channels += len(self.input.split_indices[i+1])
++                channels[i] = np.min([cum_channels, channels[i]])
++            else:
++                channels[i] = np.min([cum_channels, channels[i]])
++        channels[-1] = self.img_channels
++
+         self.layer_names = []
+-        for idx in range(self.num_layers + 1):
++        for idx in range(self.num_layers+1):
+             prev = max(idx - 1, 0)
+             is_torgb = (idx == self.num_layers)
+             is_critically_sampled = (idx >= self.num_layers - self.num_critical)
+             use_fp16 = (sampling_rates[idx] * (2 ** self.num_fp16_res) > self.img_resolution)
++            
++            n_channels_in = channels[prev]
++            n_channels_out =  channels[idx]
++            n_channels_out_final = channels[idx] # Used for assessing size after injection of FF
++
++            # Modify for concat layers
++            if(self.input.concat_layers[idx+1]): # +1 because first element corresponds to synthesis input
++                n_channels_out_final = n_channels_out # used for assessing size after injection of FF
++                n_channels_out = n_channels_in
++
+             layer = SynthesisLayer(
+                 w_dim=self.w_dim, is_torgb=is_torgb, is_critically_sampled=is_critically_sampled, use_fp16=use_fp16,
+-                in_channels=int(channels[prev]), out_channels= int(channels[idx]),
++                in_channels=int(n_channels_in), out_channels= int(n_channels_out), out_channels_final =int(n_channels_out_final),
+                 in_size=int(sizes[prev]), out_size=int(sizes[idx]),
+                 in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
+                 in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
+                 in_half_width=half_widths[prev], out_half_width=half_widths[idx],
++                synthesis_input = self.input, idx=idx,
+                 **layer_kwargs)
+             name = f'L{idx}_{layer.out_size[0]}_{layer.out_channels}'
+             setattr(self, name, layer)
+             self.layer_names.append(name)
+ 
++        self.compute_magnification_factors()
++
+     def forward(self, ws, mapped_scale=None, transform=None, crop_fn=None, **layer_kwargs):
+         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
++
+         ws = ws.to(torch.float32).unbind(dim=1)
+         if mapped_scale is not None:
+             scale = mapped_scale.to(torch.float32).unbind(dim=1)
+         else:
+             scale = [None] * self.num_ws
+-        # ws is a list of ws for every layer
+ 
+         # Execute layers.
+-        x = self.input(ws[0], transform=transform, crop_fn=crop_fn)
+-        for name, w , sc in zip(self.layer_names, ws[1:], scale[1:]):
+-            x = getattr(self, name)(x, w, sc, **layer_kwargs)
++        if "multiscale" in self.training_mode:
++            x, _ = self.input(ws[0], transform=transform, crop_fn=crop_fn)
++        else:
++            x = self.input(ws[0], transform=transform, crop_fn=crop_fn)
++        for name, w , sc, factor in zip(self.layer_names, ws[1:], scale[1:], self.factors):
++            x = getattr(self, name)(x, w, sc, transform=transform, w_input=ws[0], factor=factor, **layer_kwargs)
+         if self.output_scale != 1:
+             x = x * self.output_scale
+ 
+         # Ensure correct shape and dtype.
+         misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
+         x = x.to(torch.float32)
++
+         return x
+ 
++    def compute_magnification_factors(self):
++        
++        # init factors
++        self.factors = []        
++        cum_factor = 1
++
++        # add factors for all the layers
++        for layer_name in self.layer_names:
++            layer = getattr(self, layer_name)
++            in_size = layer.in_size[0]
++            out_size = layer.out_size[0]
++            up_factor = layer.up_factor
++            analytical_factor = (up_factor/2 * in_size) / out_size
++            cum_factor *= analytical_factor
++            self.factors.append(cum_factor**2)
++        self.factors[-1] = self.factors[-2]
++        pass
++
+     def extra_repr(self):
+         return '\n'.join([
+             f'w_dim={self.w_dim:d}, num_ws={self.num_ws:d},',
+@@ -647,6 +815,7 @@ class Generator(torch.nn.Module):
+         mapping_kwargs       = {},  # Arguments for MappingNetwork.
+         training_mode        = 'global',
+         scale_mapping_kwargs = {},  # Arguments for Scale Mapping Network
++        progressive_freqs    = False,
+         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
+     ):
+         super().__init__()
+@@ -657,13 +826,16 @@ class Generator(torch.nn.Module):
+         self.img_channels = img_channels
+         self.training_mode = training_mode
+         self.scale_mapping_kwargs = scale_mapping_kwargs
+-        use_scale_affine = True if 'patch' in self.training_mode else False # add affine layer on style input
++        scale_count = self.scale_mapping_kwargs['scale_mapping_max'] - self.scale_mapping_kwargs['scale_mapping_min'] + 1 if 'multiscale' in training_mode else 1
+         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels,
+-                                          training_mode=training_mode, use_scale_affine=use_scale_affine,
++                                          training_mode=training_mode,
++                                          scale_count=scale_count, progressive_freqs=progressive_freqs,
++                                          scale_mapping_kwargs=scale_mapping_kwargs,
+                                           **synthesis_kwargs)
+         self.num_ws = self.synthesis.num_ws
+         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+-        if 'patch' in self.training_mode:
++        
++        if 'multiscale' in self.training_mode:
+             self.scale_mapping_kwargs = scale_mapping_kwargs
+             scale_mapping_norm = scale_mapping_kwargs.scale_mapping_norm
+             scale_mapping_min = scale_mapping_kwargs.scale_mapping_min
+diff --git a/training/training_loop.py b/training/training_loop.py
+index 4bceb86..5211fe1 100644
+--- a/training/training_loop.py
++++ b/training/training_loop.py
+@@ -24,12 +24,16 @@ from torch_utils.ops import conv2d_gradfix
+ from torch_utils.ops import grid_sample_gradfix
+ 
+ import legacy
+-from metrics import metric_main
++from metrics import metric_main, metric_utils
+ 
+ from util import util
+ import random
+ from metrics import equivariance
+ 
++from util.multiscale_util import random_transform_from_scale, transform_from_scale
++
++import cv2
++
+ #----------------------------------------------------------------------------
+ 
+ def setup_snapshot_image_grid(training_set, random_seed=0):
+@@ -55,15 +59,56 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
+         # Reorder.
+         label_order = sorted(label_groups.keys())
+         for label in label_order:
+-            rnd.shuffle(label_groups[label])
++            rnd.shuffle(label_groups[label])   
++
++        # Organize into grid.
++        grid_indices = []
++        for y in range(gh):
++            row_indices = []
++            for x in range(gw):                
++                np.random.seed(seed=1317*y + x)
++                label = label_order[random.randint(0, len(label_order)-1)]
++                indices = label_groups[label]
++                np.random.seed(seed=432591*y + x)
++                index = indices[random.randint(0, len(indices)-1)]
++                row_indices.append(index)
++                # print("Label:" + str(label) + "         Index: " + str(index))
++            grid_indices += row_indices
++
++    # Load data.
++    images, labels = zip(*[training_set[i] for i in grid_indices])
++    return (gw, gh), np.stack(images), np.stack(labels)
++
++#----------------------------------------------------------------------------
++
++def setup_snapshot_image_grid_ordered(training_set, random_seed=0):
++    rnd = np.random.RandomState(random_seed)
++    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
++    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
++
++    # No labels => show random subset of training samples.
++    if not training_set.has_labels:
++        all_indices = list(range(len(training_set)))
++        rnd.shuffle(all_indices)
++        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
++
++    else:
++        # Creating copy of dataset, and sorting it
++        tmp_set = copy.deepcopy(training_set)
++        tmp_set.sort_dataset_by_label()
++        tmp_set.floor_labels()
++        set_indices = tmp_set._raw_idx
++        selected_indices_positions = np.linspace(0, len(set_indices)-1, gw*gh, dtype=int)
++        selected_indices = set_indices[selected_indices_positions]
+ 
+         # Organize into grid.
+         grid_indices = []
+         for y in range(gh):
+-            label = label_order[y % len(label_order)]
+-            indices = label_groups[label]
+-            grid_indices += [indices[x % len(indices)] for x in range(gw)]
+-            label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
++            row_indices = []
++            for x in range(gw):
++                index = selected_indices[y*gw + x]
++                row_indices.append(index)
++            grid_indices += row_indices
+ 
+     # Load data.
+     images, labels = zip(*[training_set[i] for i in grid_indices])
+@@ -94,7 +139,7 @@ def save_image_grid(img, fname, drange, grid_size):
+ def training_loop(
+     run_dir                 = '.',      # Output directory.
+     training_set_kwargs     = {},       # Options for base training set.
+-    patch_kwargs     = {},         # Options for patch dataset.
++    patch_kwargs            = {},       # Options for patch dataset.
+     data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
+     G_kwargs                = {},       # Options for generator network.
+     D_kwargs                = {},       # Options for discriminator network.
+@@ -122,11 +167,22 @@ def training_loop(
+     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
+     resume_pkl              = None,     # Network pickle to resume training from.
+     resume_kimg             = 0,        # First kimg to report when resuming training.
++    auto_resume_p           = False,    # Shall augmentation p be read from loaded pickle (will overwrite p provided with --p argument)
+     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
+     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
+     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
++    center_zoom             = False,
++    uniform_sampling        = False,
++    debug                   = False,
++    cond                    = False,
++    boost_first             = 1,
++    boost_last              = 1,
++    max_skew_kimgs          = 0,
++    warmup_kimgs            = 0,
++    tick_stop               = -1,
+     added_kwargs = {}, # added
+ ):
++    
+     # Initialize.
+     start_time = time.time()
+     device = torch.device('cuda', rank)
+@@ -146,9 +202,22 @@ def training_loop(
+     if rank == 0:
+         print('Loading training set...')
+     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
+-    training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
++    if max_skew_kimgs != 0:
++        training_set_sampler = misc.InfiniteSkewedSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed, boost_first=boost_first, boost_last=boost_last, max_skew_kimgs=max_skew_kimgs, warmup_kimgs=warmup_kimgs, curr_kimgs=resume_kimg)
++    elif uniform_sampling:
++        training_set_sampler = misc.InfiniteBalancedSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed, boost_last=boost_last)
++    else:
++        training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
+     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+ 
++    # determine normalization bounds for scale
++    scale_min, scale_max = training_set.scale_range()
++    scale_min = np.floor(scale_min)
++    scale_max = np.ceil(scale_max)
++
++    G_kwargs.scale_mapping_kwargs['scale_mapping_min'] = scale_min
++    G_kwargs.scale_mapping_kwargs['scale_mapping_max'] = scale_max
++
+     if rank == 0:
+         print()
+         print('Num images: ', len(training_set))
+@@ -156,19 +225,7 @@ def training_loop(
+         print('Label shape:', training_set.label_shape)
+         print()
+ 
+-    # Load patch dataset
+-    if 'patch' in training_mode:
+-        if rank == 0:
+-            print('Loading patch dataset...')
+-        patch_dset = dnnlib.util.construct_class_by_name(**patch_kwargs) # subclass of training.dataset.Dataset
+-        patch_dset_sampler = misc.InfiniteSampler(dataset=patch_dset, rank=rank, num_replicas=num_gpus, seed=random_seed)
+-        patch_dset_iterator = iter(torch.utils.data.DataLoader(dataset=patch_dset, sampler=patch_dset_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
+-        if rank == 0:
+-            print()
+-            print('Patch Num images: ', len(patch_dset))
+-            print('Patch Image shape:', patch_dset.image_shape)
+-            print('Patch Label shape:', patch_dset.label_shape)
+-            print()
++        print("CENTER ZOOM:", center_zoom)
+ 
+     # Construct networks.
+     if rank == 0:
+@@ -176,36 +233,17 @@ def training_loop(
+ 
+     # modified: use specified img_resolution
+     img_resolution = training_set.resolution
+-    if 'patch' in training_mode and added_kwargs.img_size is not None:
+-        img_resolution = added_kwargs.img_size
+-        if rank == 0:
+-            print("Using specified img resolution: %d" % img_resolution)
+-        assert(added_kwargs.img_size == training_set.resolution)
+-    common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=img_resolution, img_channels=training_set.num_channels)
++
++    
++    common_kwargs = dict(img_resolution=img_resolution, img_channels=training_set.num_channels)
++
++    # don't use labels as input to the networks for multiscale training
++    common_kwargs['c_dim'] = 0 if 'multiscale' in training_mode and not cond else training_set.label_dim
++
+     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
+     G_ema = copy.deepcopy(G).eval()
+ 
+-
+-    # copy G for teacher network: copy teacher G_ema to G_ema:,
+-    # uses G state dict for the generator to align with D
+-    if 'patch' in training_mode and added_kwargs.teacher is not None:
+-        teacher = copy.deepcopy(G).to(device).eval()
+-        # deactivate scale affine adding in teacher model; so it matches original model
+-        for layer_name in teacher.synthesis.layer_names:
+-            layer = getattr(teacher.synthesis, layer_name)
+-            layer.use_scale_affine = False
+-        if rank == 0:
+-            print(f"loading teacher from {added_kwargs.teacher} on device %s! " % rank)
+-            with dnnlib.util.open_url(added_kwargs.teacher) as f:
+-                teacher_data = legacy.load_network_pkl(f)
+-            for name, module in [('G', G), ('G_ema', teacher), ('G_ema', G_ema), ('D', D)]:
+-                misc.copy_params_and_buffers(teacher_data[name], module, require_all=False)
+-            print(f"done loading teacher on device %s! " % rank)
+-            # util.set_requires_grad(False, teacher)
+-    else:
+-        teacher = None
+-
+     # Resume from existing pickle.
+     if (resume_pkl is not None) and (rank == 0):
+         print(f'Resuming from "{resume_pkl}"')
+@@ -213,6 +251,9 @@ def training_loop(
+             resume_data = legacy.load_network_pkl(f)
+         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
+             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
++        if(auto_resume_p):
++            try: augment_p = resume_data['augment_pipe'].p
++            except: augment_p = 0
+ 
+     # Print network summary tables.
+     if rank == 0:
+@@ -235,8 +276,7 @@ def training_loop(
+     # Distribute across GPUs.
+     if rank == 0:
+         print(f'Distributing across {num_gpus} GPUs...')
+-    for name, module in [('G', G), ('D', D), ('G_ema', G_ema),
+-                         ('teacher', teacher), ('augment', augment_pipe)]:
++    for name, module in [('G', G), ('D', D), ('G_ema', G_ema), ('augment', augment_pipe)]:
+         if module is not None and num_gpus > 1:
+             if rank == 0:
+                 print("copied %s across gpus!" % name)
+@@ -250,7 +290,7 @@ def training_loop(
+     if rank == 0:
+         print('Setting up training phases...')
+     loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe,
+-                                               added_kwargs=added_kwargs, teacher=teacher, **loss_kwargs) # subclass of training.loss.Loss
++                                               added_kwargs=added_kwargs, **loss_kwargs) # subclass of training.loss.Loss
+ 
+     phases = []
+ 
+@@ -279,17 +319,27 @@ def training_loop(
+     grid_size = None
+     grid_z = None
+     grid_c = None
++    grid_t = None
++    grid_w = None
++    #if False:
+     if rank == 0:
+         print('Exporting sample images...')
+-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
++        grid_size, images, labels = setup_snapshot_image_grid_ordered(training_set=training_set)
++        if resume_kimg==0:
++            save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
+         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
++        grid_z_mod = torch.randn([labels.shape[0], G.z_dim], device=device)
+         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+-        print('Done exporting sample images...')
++        grid_s = torch.linspace(scale_min, scale_max, labels.shape[0])
++        grid_c = grid_s.unsqueeze(1).to(device).split(batch_gpu) # NEW
++        grid_t = random_transform_from_scale(grid_s).to(device).split(batch_gpu)
++        if resume_kimg==0:
++            images = torch.cat([G_ema(z=z, c=c, transform=t, noise_mode='const').cpu() for z, c, t in zip(grid_z, grid_c, grid_t)]).numpy()
++            save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
++            print('Done exporting sample images...')
+ 
+     # Initialize logs.
++    
+     if rank == 0:
+         print('Initializing logs...')
+     stats_collector = training_stats.Collector(regex='.*')
+@@ -301,14 +351,21 @@ def training_loop(
+         try:
+             import torch.utils.tensorboard as tensorboard
+             stats_tfevents = tensorboard.SummaryWriter(run_dir)
++            z = torch.randn([batch_gpu, G.z_dim]).to(device)
++            c = torch.zeros([batch_gpu, 1]).to(device)
++            stats_tfevents.add_graph(G, (z, c))
+         except ImportError as err:
+             print('Skipping tfevents export:', err)
+ 
+-    # Train.
++    # Train.    
++
+     if rank == 0:
+         print(f'Training for {total_kimg} kimg...')
+         print()
+     cur_nimg = resume_kimg * 1000
++    try:
++        training_set_sampler.curr_skew_imgs = cur_nimg
++    except:pass
+     cur_tick = 0
+     tick_start_nimg = cur_nimg
+     tick_start_time = time.time()
+@@ -318,25 +375,21 @@ def training_loop(
+         progress_fn(0, total_kimg)
+     while True:
+         with torch.autograd.profiler.record_function('data_fetch'):
+-            if 'patch' in training_mode:
+-                if random.uniform(0, 1) > added_kwargs.base_probability:
+-                    # base dataset iterator
+-                    phase_real_img, phase_real_c = next(training_set_iterator)
+-                    n = phase_real_img.shape[0]
+-                    phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+-                    phase_real_c = phase_real_c.to(device).split(batch_gpu)
+-                    transform = torch.eye(3)[None]
+-                    phase_transform = transform.repeat(n, 1, 1).to(device).split(batch_gpu)
+-                    min_scale = 1.0
+-                    max_scale = 1.0
++            if 'multiscale' in training_mode:
++                phase_real_img, phase_real_c = next(training_set_iterator)
++                phase_real_c_tmp = phase_real_c.squeeze(1)
++                phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)                                
++                if center_zoom:
++                    phase_transform = transform_from_scale(phase_real_c_tmp - scale_min).to(device).split(batch_gpu)
+                 else:
+-                    # patch dataset iterator
+-                    data, phase_real_c = next(patch_dset_iterator)
+-                    phase_real_img = (data['image'].to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+-                    phase_real_c = phase_real_c.to(device).split(batch_gpu)
+-                    phase_transform = data['params']['transform'].to(device).split(batch_gpu)
+-                    min_scale = data['params']['min_scale_anneal'][0].item()
+-                    max_scale = 1.0
++                    phase_transform = random_transform_from_scale(phase_real_c_tmp - scale_min).to(device).split(batch_gpu)
++                # dummy variables
++                if cond:
++                    pass
++                else:
++                    phase_real_c = [None] * len(phase_real_c)
++                min_scale = scale_min
++                max_scale = scale_max
+             else:
+                 phase_real_img, phase_real_c = next(training_set_iterator)
+                 phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+@@ -348,7 +401,10 @@ def training_loop(
+ 
+             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
+             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
+-            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
++            if cond:
++                all_gen_c = [np.float32(np.ones(1)) * float(phase_real_c_tmp[i%phase_real_c_tmp.shape[0]]) for i in range(len(phases) * batch_size)]
++            else:
++                all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
+             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
+ 
+@@ -363,7 +419,7 @@ def training_loop(
+             phase.opt.zero_grad(set_to_none=True)
+             phase.module.requires_grad_(True)
+             for transform, real_img, real_c, gen_z, gen_c in zip(phase_transform, phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
+-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, transform=transform,
++                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=gen_c, transform=transform,
+                                           gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg,
+                                           min_scale=min_scale, max_scale=max_scale)
+             phase.module.requires_grad_(False)
+@@ -426,6 +482,11 @@ def training_loop(
+         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
+         torch.cuda.reset_peak_memory_stats()
+         fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
++        try:
++            fields += [f"current_max_prob {training_set_sampler.curr_max_prob:.3f} "]
++            fields += [f"current_snimg {training_set_sampler.curr_skew_imgs:.1f} "]
++            fields += [f"warmup_snimg {training_set_sampler.warmup_imgs:.1f} "]            
++        except: pass
+         training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
+         training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
+         if rank == 0:
+@@ -437,13 +498,14 @@ def training_loop(
+             if rank == 0:
+                 print()
+                 print('Aborting...')
+-
++            
+         # Save image snapshot.
+         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
++            images = torch.cat([G_ema(z=z, c=c, transform=t, noise_mode='const').cpu() for z, c, t in zip(grid_z, grid_c, grid_t)]).numpy()
+             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+ 
+         # Save network snapshot.
++        
+         snapshot_pkl = None
+         snapshot_data = None
+         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+@@ -452,37 +514,42 @@ def training_loop(
+                 if isinstance(value, torch.nn.Module):
+                     value = copy.deepcopy(value).eval().requires_grad_(False)
+                     if num_gpus > 1:
+-                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
++                        misc.check_ddp_consistency(value, ignore_regex=r'(.*\.[^.]+_(avg|ema))|.*\.phases')
+                         for param in misc.params_and_buffers(value):
+                             torch.distributed.broadcast(param, src=0)
+                     snapshot_data[key] = value.cpu()
+                 del value # conserve memory
+-            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
++            snapshot_filename = f'network-snapshot-{cur_nimg//1000:06d}.pkl'
++            snapshot_pkl = os.path.join(run_dir, snapshot_filename)
+             if rank == 0:
+                 with open(snapshot_pkl, 'wb') as f:
+-                    pickle.dump(snapshot_data, f)
++                    pickle.dump(snapshot_data, f)                
++                if not debug:
++                    with open(os.path.join(run_dir, "last.pkl"), 'w') as f:
++                        f.write(snapshot_filename)
+ 
+         # Evaluate metrics.
+         if (snapshot_data is not None) and (len(metrics) > 0):
+             if rank == 0:
+                 print('Evaluating metrics...')
+             for metric in metrics:
++                #progress = metric_utils.ProgressMonitor(verbose=True)
+                 result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
+-                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device)
++                    dataset_kwargs=training_set_kwargs, num_gpus=num_gpus, rank=rank, device=device, center_zoom=center_zoom, cond=cond) #, progress=progress)
+                 if rank == 0:
+                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
+                 stats_metrics.update(result_dict.results)
+         del snapshot_data # conserve memory
+ 
+         # Collect statistics.
+-        for phase in phases:
+-            value = []
+-            if (phase.start_event is not None) and (phase.end_event is not None):
+-                phase.end_event.synchronize()
+-                value = phase.start_event.elapsed_time(phase.end_event)
+-            training_stats.report0('Timing/' + phase.name, value)
++        value = []
++        if (phase.start_event is not None) and (phase.end_event is not None):
++            phase.end_event.synchronize()
++            value = phase.start_event.elapsed_time(phase.end_event)
++        training_stats.report0('Timing/' + phase.name, value)
+         stats_collector.update()
+         stats_dict = stats_collector.as_dict()
++        
+ 
+         # Update logs.
+         timestamp = time.time()
+@@ -500,6 +567,13 @@ def training_loop(
+             stats_tfevents.flush()
+         if progress_fn is not None:
+             progress_fn(cur_nimg // 1000, total_kimg)
++        
++        # Finishing task when number of scheduled tikcs for given task is reached
++        if cur_tick >= tick_stop and tick_stop > 0:
++            done = True
++            if rank == 0:
++                print()
++                print('Number of scheduled ticks reached. Aborting current subtask.')
+ 
+         # Update state.
+         cur_tick += 1
+diff --git a/util/patch_util.py b/util/patch_util.py
+index e8260a1..f478717 100644
+--- a/util/patch_util.py
++++ b/util/patch_util.py
+@@ -109,13 +109,13 @@ def generate_full_from_patches(new_size, patch_size=256):
+             patch_params.append(((y, y+patch_size, x, x+patch_size), transform))
+     return patch_params
+ 
+-def compute_scale_inputs(G, w, transform):
++def compute_scale_inputs(G, w, transform, c):
+     if transform is None:
+         scale = torch.ones(w.shape[0], 1).to(w.device)
+     else:
+         scale = 1/transform[:, [0], 0]
+     scale = G.scale_norm(scale)
+-    mapped_scale = G.scale_mapping(scale, None)
++    mapped_scale = G.scale_mapping(scale, c)
+     return scale, mapped_scale
+ 
+ def scale_condition_wrapper(G, w, transform, **kwargs):
